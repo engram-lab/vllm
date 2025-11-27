@@ -720,6 +720,11 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+        
+        # Clear any active cartridge KV for finished requests.
+        from vllm.v1.cartridge_loader import clear_active_cartridge_kv
+        for req_id in scheduler_output.finished_req_ids:
+            clear_active_cartridge_kv(req_id)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -956,6 +961,37 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+
+    def _get_cartridge_kv_for_batch(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
+        """Get cartridge KV for the current batch if any requests have active cartridges.
+        
+        Returns:
+            Dictionary mapping layer index to (key, value) tensors, or None
+            if no requests have active cartridges.
+        """
+        from vllm.v1.cartridge_loader import get_active_cartridge_kv
+        
+        # Check all scheduled requests for active cartridge KV
+        merged_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+        
+        for req_id in scheduler_output.num_scheduled_tokens.keys():
+            cartridge_kv = get_active_cartridge_kv(req_id)
+            if cartridge_kv is not None:
+                if merged_kv is None:
+                    # First cartridge found - use it directly
+                    merged_kv = cartridge_kv
+                else:
+                    # Multiple cartridges - for now we only support one
+                    # In the future, could concatenate or handle per-request
+                    logger.warning(
+                        "Multiple requests have active cartridges. "
+                        "Only the first cartridge will be used."
+                    )
+                    break
+        
+        return merged_kv
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
@@ -2894,6 +2930,9 @@ class GPUModelRunner(
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
+        # Get any active cartridge KV for the current requests
+        cartridge_kv = self._get_cartridge_kv_for_batch(scheduler_output)
+        
         with (
             set_forward_context(
                 attn_metadata,
@@ -2903,6 +2942,7 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_descriptor,
                 ubatch_slices=ubatch_slices,
+                cartridge_kv=cartridge_kv,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,

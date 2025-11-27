@@ -290,23 +290,34 @@ class OpenAIServing:
         self.max_model_len = self.model_config.max_model_len
 
     def _process_cartridges(
-        self, cartridges: list[dict[str, Any]] | None, prompt_token_ids: list[int]
+        self,
+        cartridges: list[dict[str, Any]] | None,
+        prompt_token_ids: list[int],
+        request_id: str | None = None,
     ) -> list[int]:
         """
-        Load cartridges and prepend their token IDs to the prompt.
+        Load cartridges and process them for the request.
+
+        For pre-computed cartridges (with token_ids): prepend token IDs to prompt.
+        For learned cartridges (soft prompts): KV cache injection is used instead.
 
         Args:
             cartridges: List of cartridge specifications from the request
             prompt_token_ids: Original prompt token IDs
+            request_id: Request ID to associate with learned cartridges
 
         Returns:
-            Combined token IDs with cartridge tokens prepended
+            Combined token IDs with cartridge tokens prepended (for pre-computed),
+            or original prompt_token_ids (for learned cartridges)
         """
         if not cartridges:
             return prompt_token_ids
 
         from vllm.logger import init_logger
-        from vllm.v1.cartridge_loader import load_cartridges_from_request
+        from vllm.v1.cartridge_loader import (
+            load_cartridges_from_request,
+            set_active_cartridge_kv,
+        )
 
         logger = init_logger(__name__)
 
@@ -314,15 +325,49 @@ class OpenAIServing:
             # Load all cartridges
             loaded_cartridges = load_cartridges_from_request(cartridges)
 
-            # Prepend cartridge token IDs to the prompt
-            cartridge_token_ids = []
+            # Separate learned and pre-computed cartridges
+            learned_cartridges = []
+            precomputed_cartridges = []
+            
             for cartridge_data in loaded_cartridges:
+                if cartridge_data.is_learned:
+                    learned_cartridges.append(cartridge_data)
+                elif cartridge_data.has_valid_token_ids():
+                    precomputed_cartridges.append(cartridge_data)
+                else:
+                    logger.warning(
+                        f"Skipping cartridge with no valid token_ids and not marked as learned"
+                    )
+            
+            # Handle learned cartridges (KV injection)
+            if learned_cartridges and request_id:
+                # Set the active cartridge KV for this request
+                # Currently only supports one learned cartridge per request
+                if len(learned_cartridges) > 1:
+                    logger.warning(
+                        "Multiple learned cartridges detected. "
+                        "Only the first one will be used."
+                    )
+                
+                cartridge_data = learned_cartridges[0]
+                set_active_cartridge_kv(request_id, cartridge_data)
+                
+                logger.info(
+                    f"Set learned cartridge KV for request {request_id}: "
+                    f"{cartridge_data.num_tokens} tokens, "
+                    f"{len(cartridge_data.kv_cache)} layer KV caches. "
+                    f"KV injection will be used for attention."
+                )
+                
+            # Handle pre-computed cartridges (token prepending for prefix caching)
+            cartridge_token_ids = []
+            for cartridge_data in precomputed_cartridges:
                 cartridge_token_ids.extend(cartridge_data.token_ids.tolist())
 
             if cartridge_token_ids:
                 logger.info(
                     f"Prepending {len(cartridge_token_ids)} tokens from "
-                    f"{len(loaded_cartridges)} cartridge(s) to prompt"
+                    f"{len(precomputed_cartridges)} pre-computed cartridge(s) to prompt"
                 )
                 return cartridge_token_ids + prompt_token_ids
             else:

@@ -215,7 +215,9 @@ class OpenAIServingCompletion(OpenAIServing):
                 if request.cartridges and "prompt_token_ids" in engine_prompt:
                     cartridge_dicts = [c.model_dump() for c in request.cartridges]
                     engine_prompt["prompt_token_ids"] = self._process_cartridges(
-                        cartridge_dicts, engine_prompt["prompt_token_ids"]
+                        cartridge_dicts,
+                        engine_prompt["prompt_token_ids"],
+                        request_id=request_id_item,
                     )
 
                 if isinstance(sampling_params, BeamSearchParams):
