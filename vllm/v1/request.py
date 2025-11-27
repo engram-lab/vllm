@@ -44,6 +44,7 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        cartridge_kv: list[torch.Tensor] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -103,6 +104,10 @@ class Request:
         self.num_encoder_inputs = len(self.mm_features)
         self.has_encoder_inputs = self.num_encoder_inputs > 0
 
+        # Cartridge KV for learned cartridge injection
+        # Format: [stacked_keys, stacked_values] where each is (num_layers, num_heads, seq_len, head_dim)
+        self.cartridge_kv = cartridge_kv
+
         # Read-only views
         # Prevent directly appending to these lists since
         # they should also be updated simultaneously.
@@ -153,6 +158,7 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            cartridge_kv=request.cartridge_kv,
         )
 
     def append_output_token_ids(

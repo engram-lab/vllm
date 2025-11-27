@@ -405,6 +405,9 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        # Cartridge KV cache for learned cartridge injection.
+        # Maps request_id -> dict[layer_idx, (key, value)]
+        self.cartridge_kv_cache: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         self.comm_stream = torch.cuda.Stream()
 
         # Input Batch
@@ -722,9 +725,9 @@ class GPUModelRunner(
             self.input_batch.remove_request(req_id)
         
         # Clear any active cartridge KV for finished requests.
-        from vllm.v1.cartridge_loader import clear_active_cartridge_kv
         for req_id in scheduler_output.finished_req_ids:
-            clear_active_cartridge_kv(req_id)
+            if req_id in self.cartridge_kv_cache:
+                del self.cartridge_kv_cache[req_id]
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -784,6 +787,22 @@ class GPUModelRunner(
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
+
+            # Store cartridge KV if present
+            if new_req_data.cartridge_kv is not None:
+                stacked_keys, stacked_values = new_req_data.cartridge_kv
+                # Convert stacked format to per-layer dict
+                # Shape: (num_layers, num_heads, seq_len, head_dim)
+                layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+                num_layers = stacked_keys.shape[0]
+                for layer_idx in range(num_layers):
+                    layer_kv[layer_idx] = (
+                        stacked_keys[layer_idx].to(self.device),
+                        stacked_values[layer_idx].to(self.device),
+                    )
+                self.cartridge_kv_cache[req_id] = layer_kv
+                logger.info(f"[CARTRIDGE] Stored KV for request {req_id}: "
+                           f"{num_layers} layers, seq_len={stacked_keys.shape[2]}")
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -971,20 +990,19 @@ class GPUModelRunner(
             Dictionary mapping layer index to (key, value) tensors, or None
             if no requests have active cartridges.
         """
-        from vllm.v1.cartridge_loader import get_active_cartridge_kv
-        
-        # Check all scheduled requests for active cartridge KV
+        # Check all scheduled requests for active cartridge KV in local cache
         merged_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
         
-        for req_id in scheduler_output.num_scheduled_tokens.keys():
-            cartridge_kv = get_active_cartridge_kv(req_id)
+        scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        
+        for req_id in scheduled_req_ids:
+            cartridge_kv = self.cartridge_kv_cache.get(req_id)
             if cartridge_kv is not None:
                 if merged_kv is None:
                     # First cartridge found - use it directly
                     merged_kv = cartridge_kv
                 else:
                     # Multiple cartridges - for now we only support one
-                    # In the future, could concatenate or handle per-request
                     logger.warning(
                         "Multiple requests have active cartridges. "
                         "Only the first cartridge will be used."

@@ -47,6 +47,10 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Learned cartridge KV for injection into attention.
+    # Format: [stacked_keys, stacked_values] where each is (num_layers, num_heads, seq_len, head_dim)
+    cartridge_kv: "list[torch.Tensor] | None" = None
+
     @classmethod
     def from_request(
         cls,
@@ -65,6 +69,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            cartridge_kv=request.cartridge_kv,
         )
 
     def __repr__(self) -> str:

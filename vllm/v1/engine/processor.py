@@ -3,7 +3,10 @@
 
 import time
 from collections.abc import Mapping
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
+
+if TYPE_CHECKING:
+    import torch
 
 from vllm.config import VllmConfig
 from vllm.inputs import ProcessorInputs, PromptType, SingletonInputs
@@ -394,6 +397,7 @@ class Processor:
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        cartridge_kv: list["torch.Tensor"] | None = None,
     ) -> EngineCoreRequest:
         self._validate_lora(lora_request)
         self._validate_params(params)
@@ -522,6 +526,7 @@ class Processor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            cartridge_kv=cartridge_kv,
         )
 
     def _validate_model_inputs(

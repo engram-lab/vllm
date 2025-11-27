@@ -294,12 +294,12 @@ class OpenAIServing:
         cartridges: list[dict[str, Any]] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
-    ) -> list[int]:
+    ) -> tuple[list[int], list["torch.Tensor"] | None]:
         """
         Load cartridges and process them for the request.
 
         For pre-computed cartridges (with token_ids): prepend token IDs to prompt.
-        For learned cartridges (soft prompts): KV cache injection is used instead.
+        For learned cartridges (soft prompts): returns stacked KV tensors for IPC.
 
         Args:
             cartridges: List of cartridge specifications from the request
@@ -307,16 +307,20 @@ class OpenAIServing:
             request_id: Request ID to associate with learned cartridges
 
         Returns:
-            Combined token IDs with cartridge tokens prepended (for pre-computed),
-            or original prompt_token_ids (for learned cartridges)
+            Tuple of:
+            - Combined token IDs with cartridge tokens prepended (for pre-computed),
+              or original prompt_token_ids (for learned cartridges)
+            - Stacked cartridge KV tensors [keys, values] for learned cartridges,
+              or None if no learned cartridge
         """
+        import torch
+        
         if not cartridges:
-            return prompt_token_ids
+            return prompt_token_ids, None
 
         from vllm.logger import init_logger
         from vllm.v1.cartridge_loader import (
             load_cartridges_from_request,
-            set_active_cartridge_kv,
         )
 
         logger = init_logger(__name__)
@@ -339,9 +343,9 @@ class OpenAIServing:
                         f"Skipping cartridge with no valid token_ids and not marked as learned"
                     )
             
-            # Handle learned cartridges (KV injection)
-            if learned_cartridges and request_id:
-                # Set the active cartridge KV for this request
+            # Handle learned cartridges - create stacked tensors for IPC
+            stacked_cartridge_kv: list[torch.Tensor] | None = None
+            if learned_cartridges:
                 # Currently only supports one learned cartridge per request
                 if len(learned_cartridges) > 1:
                     logger.warning(
@@ -350,14 +354,40 @@ class OpenAIServing:
                     )
                 
                 cartridge_data = learned_cartridges[0]
-                set_active_cartridge_kv(request_id, cartridge_data)
                 
-                logger.info(
-                    f"Set learned cartridge KV for request {request_id}: "
-                    f"{cartridge_data.num_tokens} tokens, "
-                    f"{len(cartridge_data.kv_cache)} layer KV caches. "
-                    f"KV injection will be used for attention."
-                )
+                # Stack all layer KVs into tensors for IPC
+                # Input format: kv_cache = {'layers.N.attention.prefix.keys': tensor, ...}
+                # Output format: [stacked_keys, stacked_values] where each is (num_layers, num_heads, seq_len, head_dim)
+                import re
+                keys_by_layer: dict[int, torch.Tensor] = {}
+                values_by_layer: dict[int, torch.Tensor] = {}
+                
+                for key_name, tensor in cartridge_data.kv_cache.items():
+                    match = re.match(r'layers\.(\d+)\.attention\.prefix\.(keys|values)', key_name)
+                    if match:
+                        layer_idx = int(match.group(1))
+                        kv_type = match.group(2)
+                        
+                        # Handle shape: (batch, seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim)
+                        if tensor.dim() == 4:
+                            tensor = tensor.squeeze(0).permute(1, 0, 2)
+                        
+                        if kv_type == 'keys':
+                            keys_by_layer[layer_idx] = tensor
+                        else:
+                            values_by_layer[layer_idx] = tensor
+                
+                if keys_by_layer and values_by_layer:
+                    # Stack into (num_layers, num_heads, seq_len, head_dim)
+                    num_layers = max(keys_by_layer.keys()) + 1
+                    stacked_keys = torch.stack([keys_by_layer[i] for i in range(num_layers)])
+                    stacked_values = torch.stack([values_by_layer[i] for i in range(num_layers)])
+                    stacked_cartridge_kv = [stacked_keys, stacked_values]
+                    
+                    logger.info(
+                        f"[CARTRIDGE] Created stacked KV for IPC: "
+                        f"keys={stacked_keys.shape}, values={stacked_values.shape}"
+                    )
                 
             # Handle pre-computed cartridges (token prepending for prefix caching)
             cartridge_token_ids = []
@@ -369,9 +399,9 @@ class OpenAIServing:
                     f"Prepending {len(cartridge_token_ids)} tokens from "
                     f"{len(precomputed_cartridges)} pre-computed cartridge(s) to prompt"
                 )
-                return cartridge_token_ids + prompt_token_ids
+                return cartridge_token_ids + prompt_token_ids, stacked_cartridge_kv
             else:
-                return prompt_token_ids
+                return prompt_token_ids, stacked_cartridge_kv
 
         except Exception as e:
             logger.error(f"Failed to process cartridges: {e}")
@@ -1295,6 +1325,7 @@ class OpenAIServing:
         lora_request: LoRARequest | None,
         trace_headers: Mapping[str, str] | None,
         priority: int,
+        cartridge_kv: list[torch.Tensor] | None = None,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
         """Use the Processor to process inputs for AsyncLLM."""
         tokenization_kwargs: dict[str, Any] = {}
@@ -1310,6 +1341,7 @@ class OpenAIServing:
             tokenization_kwargs=tokenization_kwargs,
             trace_headers=trace_headers,
             priority=priority,
+            cartridge_kv=cartridge_kv,
         )
         return engine_request, tokenization_kwargs
 

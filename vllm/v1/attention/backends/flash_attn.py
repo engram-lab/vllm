@@ -607,6 +607,13 @@ class FlashAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_seqs = attn_metadata.query_start_loc.shape[0] - 1
         
+        # Log cartridge attention (only for layer 0 to avoid spam)
+        layer_name = getattr(layer, 'layer_name', '')
+        if 'layers.0' in layer_name:
+            logger.info(f"[CARTRIDGE ATTN] Injecting cartridge KV: "
+                       f"cartridge_seq_len={cartridge_k.shape[1]}, "
+                       f"num_query_tokens={num_actual_tokens}")
+        
         # Get cartridge sequence length
         # Input shape is (num_kv_heads, seq_len, head_size)
         cartridge_seq_len = cartridge_k.shape[1]

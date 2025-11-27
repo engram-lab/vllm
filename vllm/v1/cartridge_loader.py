@@ -41,12 +41,15 @@ def set_active_cartridge_kv(
     This converts the CartridgeData format to the format expected by
     the attention layer: {layer_idx: (key, value)}.
     
+    Expected output shape per tensor: (num_kv_heads, seq_len, head_size)
+    
     Args:
         request_id: The request ID to associate with this cartridge
         cartridge_data: The loaded cartridge data
         device: Device to move tensors to
     """
     if not cartridge_data.is_learned or not cartridge_data.kv_cache:
+        logger.warning(f"Cartridge for request {request_id} skipped: is_learned={cartridge_data.is_learned}, has_kv_cache={bool(cartridge_data.kv_cache)}")
         return
     
     layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -62,6 +65,18 @@ def set_active_cartridge_kv(
         if match:
             layer_idx = int(match.group(1))
             kv_type = match.group(2)
+            
+            # Handle different input shapes:
+            # - (batch, seq_len, num_heads, head_dim) from torchtitan/cartridges lib
+            # - (num_heads, seq_len, head_dim) expected by attention
+            if tensor.dim() == 4:
+                # Shape: (batch, seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim)
+                # Squeeze batch dim and transpose to (num_heads, seq_len, head_dim)
+                tensor = tensor.squeeze(0)  # (seq_len, num_heads, head_dim)
+                tensor = tensor.permute(1, 0, 2)  # (num_heads, seq_len, head_dim)
+            elif tensor.dim() != 3:
+                logger.warning(f"Cartridge layer {layer_idx} {kv_type}: unexpected shape {tensor.shape}")
+            
             tensor = tensor.to(device)
             if kv_type == 'keys':
                 keys_by_layer[layer_idx] = tensor
@@ -75,7 +90,8 @@ def set_active_cartridge_kv(
     
     if layer_kv:
         _active_cartridge_kv[request_id] = layer_kv
-        logger.info(f"Set cartridge KV for request {request_id}: {len(layer_kv)} layers")
+        first_layer = next(iter(layer_kv.values()))
+        logger.info(f"[CARTRIDGE] Set KV for request {request_id}: {len(layer_kv)} layers, shape: {first_layer[0].shape}")
 
 
 def get_active_cartridge_kv(
@@ -83,6 +99,11 @@ def get_active_cartridge_kv(
 ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
     """Get the active cartridge KV for a request."""
     return _active_cartridge_kv.get(request_id)
+
+
+def get_all_active_cartridge_request_ids() -> list[str]:
+    """Get all request IDs that have active cartridge KV."""
+    return list(_active_cartridge_kv.keys())
 
 
 def clear_active_cartridge_kv(request_id: str) -> None:
