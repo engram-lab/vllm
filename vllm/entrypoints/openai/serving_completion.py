@@ -212,9 +212,10 @@ class OpenAIServingCompletion(OpenAIServing):
                 engine_prompt = cast(EmbedsPrompt | TokensPrompt, engine_prompt)
 
                 # Process cartridges if present
+                cartridge_kv = None
                 if request.cartridges and "prompt_token_ids" in engine_prompt:
                     cartridge_dicts = [c.model_dump() for c in request.cartridges]
-                    engine_prompt["prompt_token_ids"] = self._process_cartridges(
+                    engine_prompt["prompt_token_ids"], cartridge_kv = self._process_cartridges(
                         cartridge_dicts,
                         engine_prompt["prompt_token_ids"],
                         request_id=request_id_item,
@@ -236,6 +237,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
+                        cartridge_kv=cartridge_kv,
                     )
 
                     generator = self.engine_client.generate(

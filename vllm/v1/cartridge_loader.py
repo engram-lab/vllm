@@ -30,6 +30,10 @@ logger = init_logger(__name__)
 # Maps request_id -> {layer_idx: (key_tensor, value_tensor)}
 _active_cartridge_kv: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
 
+# In-memory cache for parsed CartridgeData objects
+# Maps (cartridge_id, source) -> CartridgeData
+_cartridge_data_cache: dict[tuple[str, str], "CartridgeData"] = {}
+
 
 def set_active_cartridge_kv(
     request_id: str,
@@ -41,7 +45,8 @@ def set_active_cartridge_kv(
     This converts the CartridgeData format to the format expected by
     the attention layer: {layer_idx: (key, value)}.
     
-    Expected output shape per tensor: (num_kv_heads, seq_len, head_size)
+    Input shape from TrainableCache: (1, seq_len, num_kv_heads, head_dim)
+    Output shape per tensor: (num_kv_heads, seq_len, head_dim)
     
     Args:
         request_id: The request ID to associate with this cartridge
@@ -66,14 +71,12 @@ def set_active_cartridge_kv(
             layer_idx = int(match.group(1))
             kv_type = match.group(2)
             
-            # Handle different input shapes:
-            # - (batch, seq_len, num_heads, head_dim) from torchtitan/cartridges lib
-            # - (num_heads, seq_len, head_dim) expected by attention
+            # TrainableCache saves with shape: (1, seq_len, num_kv_heads, head_dim)
+            # Attention expects: (num_kv_heads, seq_len, head_dim)
+            # Need to squeeze batch dim AND permute to swap seq_len and num_kv_heads
             if tensor.dim() == 4:
-                # Shape: (batch, seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim)
-                # Squeeze batch dim and transpose to (num_heads, seq_len, head_dim)
-                tensor = tensor.squeeze(0)  # (seq_len, num_heads, head_dim)
-                tensor = tensor.permute(1, 0, 2)  # (num_heads, seq_len, head_dim)
+                tensor = tensor.squeeze(0)  # (seq_len, num_kv_heads, head_dim)
+                tensor = tensor.permute(1, 0, 2)  # (num_kv_heads, seq_len, head_dim)
             elif tensor.dim() != 3:
                 logger.warning(f"Cartridge layer {layer_idx} {kv_type}: unexpected shape {tensor.shape}")
             
@@ -111,6 +114,12 @@ def clear_active_cartridge_kv(request_id: str) -> None:
     if request_id in _active_cartridge_kv:
         del _active_cartridge_kv[request_id]
         logger.debug(f"Cleared cartridge KV for request {request_id}")
+
+
+def clear_cartridge_data_cache() -> None:
+    """Clear the in-memory cartridge data cache."""
+    _cartridge_data_cache.clear()
+    logger.info("Cleared cartridge data cache")
 
 
 class CartridgeData:
@@ -159,6 +168,9 @@ class CartridgeData:
         self.kv_cache = kv_cache or {}
         self.metadata = metadata or {}
         
+        # Cached stacked KV tensors (computed lazily)
+        self._stacked_kv: list[torch.Tensor] | None = None
+        
         # Handle token_ids
         if token_ids is None:
             self.token_ids = torch.tensor([], dtype=torch.long)
@@ -200,6 +212,56 @@ class CartridgeData:
         """Check if this cartridge has valid token IDs for prepending."""
         return len(self.token_ids) > 0 and not self.is_learned
 
+    def get_stacked_kv(self) -> list[torch.Tensor] | None:
+        """Get stacked KV tensors for IPC, computing and caching on first call.
+        
+        Input from TrainableCache: (1, seq_len, num_kv_heads, head_dim) per layer
+        Output: [stacked_keys, stacked_values] where each has shape
+            (num_layers, num_kv_heads, seq_len, head_dim), or None if no KV cache.
+        """
+        if not self.is_learned or not self.kv_cache:
+            return None
+        
+        # Return cached result if available
+        if self._stacked_kv is not None:
+            return self._stacked_kv
+        
+        import re
+        keys_by_layer: dict[int, torch.Tensor] = {}
+        values_by_layer: dict[int, torch.Tensor] = {}
+        
+        for key_name, tensor in self.kv_cache.items():
+            match = re.match(r'layers\.(\d+)\.attention\.prefix\.(keys|values)', key_name)
+            if match:
+                layer_idx = int(match.group(1))
+                kv_type = match.group(2)
+                
+                # TrainableCache saves with shape: (1, seq_len, num_kv_heads, head_dim)
+                # flash_attn expects per-layer shape: (num_kv_heads, seq_len, head_dim)
+                # Need to squeeze batch dim AND permute to swap seq_len and num_kv_heads
+                if tensor.dim() == 4:
+                    tensor = tensor.squeeze(0)  # (seq_len, num_kv_heads, head_dim)
+                    tensor = tensor.permute(1, 0, 2)  # (num_kv_heads, seq_len, head_dim)
+                
+                if kv_type == 'keys':
+                    keys_by_layer[layer_idx] = tensor
+                else:
+                    values_by_layer[layer_idx] = tensor
+        
+        if keys_by_layer and values_by_layer:
+            # Stack into (num_layers, num_kv_heads, seq_len, head_dim)
+            num_layers = max(keys_by_layer.keys()) + 1
+            stacked_keys = torch.stack([keys_by_layer[i] for i in range(num_layers)])
+            stacked_values = torch.stack([values_by_layer[i] for i in range(num_layers)])
+            self._stacked_kv = [stacked_keys, stacked_values]
+            
+            logger.info(
+                f"[CARTRIDGE] Computed stacked KV: "
+                f"keys={stacked_keys.shape}, values={stacked_values.shape}"
+            )
+        
+        return self._stacked_kv
+
     @classmethod
     def from_dict(cls, data: dict) -> "CartridgeData":
         """Load CartridgeData from a dictionary (loaded .pt file).
@@ -236,6 +298,10 @@ class CartridgeData:
                 trainable_values = data.get('trainable_values', [])
                 frozen_keys = data.get('frozen_keys', [])
                 frozen_values = data.get('frozen_values', [])
+                
+                # Debug: log the loaded tensor shapes
+                if trainable_keys:
+                    logger.info(f"[CARTRIDGE DEBUG] trainable_keys[0] shape: {trainable_keys[0].shape if hasattr(trainable_keys[0], 'shape') else 'no shape'}")
                 
                 # Combine trainable and frozen, preferring trainable
                 all_keys = trainable_keys if trainable_keys else frozen_keys
@@ -330,6 +396,13 @@ def load_cartridge(
         ValueError: If cartridge format is invalid
         RuntimeError: If loading fails
     """
+    cache_key = (cartridge_id, source)
+    
+    # Check in-memory cache first (unless force_redownload)
+    if not force_redownload and cache_key in _cartridge_data_cache:
+        logger.debug(f"Using cached CartridgeData for: {cartridge_id}")
+        return _cartridge_data_cache[cache_key]
+    
     logger.info(
         f"Loading cartridge: {cartridge_id} (source={source}, "
         f"force_redownload={force_redownload})"
@@ -352,6 +425,10 @@ def load_cartridge(
         )
 
     logger.info(f"Successfully loaded cartridge: {cartridge_data}")
+    
+    # Cache the parsed cartridge data
+    _cartridge_data_cache[cache_key] = cartridge_data
+    
     return cartridge_data
 
 

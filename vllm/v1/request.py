@@ -192,6 +192,10 @@ class Request:
         return len(self._output_token_ids)
 
     def get_skip_reading_prefix_cache(self) -> bool:
+        # Cartridge requests must skip prefix cache because cached KV was
+        # computed with different RoPE positions (without cartridge offset).
+        if self.cartridge_kv is not None:
+            return True
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None

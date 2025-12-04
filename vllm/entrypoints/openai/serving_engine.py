@@ -343,7 +343,7 @@ class OpenAIServing:
                         f"Skipping cartridge with no valid token_ids and not marked as learned"
                     )
             
-            # Handle learned cartridges - create stacked tensors for IPC
+            # Handle learned cartridges - get stacked tensors for IPC (cached)
             stacked_cartridge_kv: list[torch.Tensor] | None = None
             if learned_cartridges:
                 # Currently only supports one learned cartridge per request
@@ -355,39 +355,8 @@ class OpenAIServing:
                 
                 cartridge_data = learned_cartridges[0]
                 
-                # Stack all layer KVs into tensors for IPC
-                # Input format: kv_cache = {'layers.N.attention.prefix.keys': tensor, ...}
-                # Output format: [stacked_keys, stacked_values] where each is (num_layers, num_heads, seq_len, head_dim)
-                import re
-                keys_by_layer: dict[int, torch.Tensor] = {}
-                values_by_layer: dict[int, torch.Tensor] = {}
-                
-                for key_name, tensor in cartridge_data.kv_cache.items():
-                    match = re.match(r'layers\.(\d+)\.attention\.prefix\.(keys|values)', key_name)
-                    if match:
-                        layer_idx = int(match.group(1))
-                        kv_type = match.group(2)
-                        
-                        # Handle shape: (batch, seq_len, num_heads, head_dim) -> (num_heads, seq_len, head_dim)
-                        if tensor.dim() == 4:
-                            tensor = tensor.squeeze(0).permute(1, 0, 2)
-                        
-                        if kv_type == 'keys':
-                            keys_by_layer[layer_idx] = tensor
-                        else:
-                            values_by_layer[layer_idx] = tensor
-                
-                if keys_by_layer and values_by_layer:
-                    # Stack into (num_layers, num_heads, seq_len, head_dim)
-                    num_layers = max(keys_by_layer.keys()) + 1
-                    stacked_keys = torch.stack([keys_by_layer[i] for i in range(num_layers)])
-                    stacked_values = torch.stack([values_by_layer[i] for i in range(num_layers)])
-                    stacked_cartridge_kv = [stacked_keys, stacked_values]
-                    
-                    logger.info(
-                        f"[CARTRIDGE] Created stacked KV for IPC: "
-                        f"keys={stacked_keys.shape}, values={stacked_values.shape}"
-                    )
+                # Get stacked KV tensors (computed once, then cached)
+                stacked_cartridge_kv = cartridge_data.get_stacked_kv()
                 
             # Handle pre-computed cartridges (token prepending for prefix caching)
             cartridge_token_ids = []

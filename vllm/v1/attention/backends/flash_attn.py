@@ -609,10 +609,11 @@ class FlashAttentionImpl(AttentionImpl):
         
         # Log cartridge attention (only for layer 0 to avoid spam)
         layer_name = getattr(layer, 'layer_name', '')
-        if 'layers.0' in layer_name:
-            logger.info(f"[CARTRIDGE ATTN] Injecting cartridge KV: "
-                       f"cartridge_seq_len={cartridge_k.shape[1]}, "
-                       f"num_query_tokens={num_actual_tokens}")
+        # if 'layers.0' in layer_name:
+            # logger.info(f"[CARTRIDGE ATTN] Input cartridge_k shape: {cartridge_k.shape}, "
+            #            f"num_seqs={num_seqs}, num_query_tokens={num_actual_tokens}, "
+            #            f"query_start_loc={attn_metadata.query_start_loc.tolist()}, "
+            #            f"query shape: {query.shape}")
         
         # Get cartridge sequence length
         # Input shape is (num_kv_heads, seq_len, head_size)
@@ -634,10 +635,11 @@ class FlashAttentionImpl(AttentionImpl):
         
         # Replicate cartridge KV for each sequence in the batch
         # Shape: (num_seqs * cartridge_seq_len, num_kv_heads, head_size)
-        cartridge_k_batch = cartridge_k.unsqueeze(0).expand(num_seqs, -1, -1, -1).reshape(
+        # Note: expand() creates a non-contiguous view, need contiguous() before reshape()
+        cartridge_k_batch = cartridge_k.unsqueeze(0).expand(num_seqs, -1, -1, -1).contiguous().reshape(
             num_seqs * cartridge_seq_len, self.num_kv_heads, self.head_size
         )
-        cartridge_v_batch = cartridge_v.unsqueeze(0).expand(num_seqs, -1, -1, -1).reshape(
+        cartridge_v_batch = cartridge_v.unsqueeze(0).expand(num_seqs, -1, -1, -1).contiguous().reshape(
             num_seqs * cartridge_seq_len, self.num_kv_heads, self.head_size
         )
         
@@ -679,6 +681,11 @@ class FlashAttentionImpl(AttentionImpl):
         scheduler_metadata = attn_metadata.scheduler_metadata
         descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
         
+        # Debug logging for suffix attention (layer 0 only)
+        if 'layers.0' in layer_name:
+            logger.info(f"[CARTRIDGE SUFFIX] seqused_k={seqused_k.tolist() if hasattr(seqused_k, 'tolist') else seqused_k}, "
+                       f"max_seqlen_k={max_seqlen_k}, causal={attn_metadata.causal}")
+        
         suffix_output, suffix_lse = flash_attn_varlen_func(
             q=query[:num_actual_tokens],
             k=key_cache,
@@ -704,13 +711,26 @@ class FlashAttentionImpl(AttentionImpl):
         )
         
         # Merge cartridge and suffix attention outputs using log-sum-exp
-        # FA returns LSE in shape [num_heads, num_tokens], we need [num_tokens, num_heads]
+        # FA returns LSE in shape [num_heads, num_tokens] which merge_attn_states expects
+        
+        # Debug logging for merge (layer 0 only)
+        if 'layers.0' in layer_name:
+            cart_lse_t = cartridge_lse.transpose(0, 1).contiguous()
+            suff_lse_t = suffix_lse.transpose(0, 1).contiguous()
+            logger.info(f"[CARTRIDGE MERGE] cartridge_lse shape={cart_lse_t.shape}, "
+                       f"mean={cart_lse_t.mean().item():.3f}, "
+                       f"suffix_lse shape={suff_lse_t.shape}, "
+                       f"mean={suff_lse_t.mean().item():.3f}")
+        else:
+            cart_lse_t = cartridge_lse.transpose(0, 1).contiguous()
+            suff_lse_t = suffix_lse.transpose(0, 1).contiguous()
+        
         merge_attn_states(
             output[:num_actual_tokens],
             cartridge_output,
-            cartridge_lse.transpose(0, 1).contiguous(),
+            cart_lse_t,
             suffix_output,
-            suffix_lse.transpose(0, 1).contiguous(),
+            suff_lse_t,
         )
         
         return output

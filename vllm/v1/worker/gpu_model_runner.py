@@ -408,6 +408,9 @@ class GPUModelRunner(
         # Cartridge KV cache for learned cartridge injection.
         # Maps request_id -> dict[layer_idx, (key, value)]
         self.cartridge_kv_cache: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        # Position offset for cartridge requests (for RoPE only, not token indexing)
+        # Maps request_id -> cartridge_seq_len
+        self.cartridge_position_offsets: dict[str, int] = {}
         self.comm_stream = torch.cuda.Stream()
 
         # Input Batch
@@ -724,10 +727,12 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
         
-        # Clear any active cartridge KV for finished requests.
+        # Clear any active cartridge KV and position offsets for finished requests.
         for req_id in scheduler_output.finished_req_ids:
             if req_id in self.cartridge_kv_cache:
                 del self.cartridge_kv_cache[req_id]
+            if req_id in self.cartridge_position_offsets:
+                del self.cartridge_position_offsets[req_id]
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -795,14 +800,19 @@ class GPUModelRunner(
                 # Shape: (num_layers, num_heads, seq_len, head_dim)
                 layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
                 num_layers = stacked_keys.shape[0]
+                cartridge_seq_len = stacked_keys.shape[2]
                 for layer_idx in range(num_layers):
                     layer_kv[layer_idx] = (
                         stacked_keys[layer_idx].to(self.device),
                         stacked_values[layer_idx].to(self.device),
                     )
                 self.cartridge_kv_cache[req_id] = layer_kv
+                # Store position offset for RoPE - input tokens should have RoPE positions
+                # starting AFTER the cartridge (at position cartridge_seq_len)
+                self.cartridge_position_offsets[req_id] = cartridge_seq_len
                 logger.info(f"[CARTRIDGE] Stored KV for request {req_id}: "
-                           f"{num_layers} layers, seq_len={stacked_keys.shape[2]}")
+                           f"{num_layers} layers, seq_len={cartridge_seq_len}, "
+                           f"rope_position_offset={cartridge_seq_len}")
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1329,7 +1339,6 @@ class GPUModelRunner(
             arange,
             out=positions_np,
         )
-
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1481,6 +1490,26 @@ class GPUModelRunner(
             )
         else:
             # Common case (1D positions)
+            # Apply cartridge position offsets for RoPE BEFORE copying to GPU.
+            # This must happen AFTER token indexing (which uses positions without offset).
+            # The offset ensures that input tokens have RoPE positions starting AFTER
+            # the cartridge (e.g., position 1024 if cartridge has 1024 tokens).
+            if self.cartridge_position_offsets:
+                positions_np = self.positions.np[:total_num_scheduled_tokens]
+                token_idx = 0
+                for req_idx in range(num_reqs):
+                    req_id = self.input_batch.req_ids[req_idx]
+                    n_tokens = num_scheduled_tokens[req_idx]
+                    if req_id in self.cartridge_position_offsets:
+                        offset = self.cartridge_position_offsets[req_id]
+                        # Log before/after for debugging
+                        before_positions = positions_np[token_idx:token_idx + n_tokens].copy()
+                        positions_np[token_idx:token_idx + n_tokens] += offset
+                        after_positions = positions_np[token_idx:token_idx + n_tokens]
+                        # logger.info(f"[CARTRIDGE POSITIONS] req_id={req_id}, offset={offset}, "
+                        #            f"n_tokens={n_tokens}, positions before=[{before_positions[0]}..{before_positions[-1]}], "
+                        #            f"after=[{after_positions[0]}..{after_positions[-1]}]")
+                    token_idx += n_tokens
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
 
         use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
