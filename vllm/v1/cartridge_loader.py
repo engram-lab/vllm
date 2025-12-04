@@ -186,27 +186,17 @@ class CartridgeData:
             self.num_tokens = len(token_ids)
     
     def _infer_num_tokens_from_kv_cache(self) -> int:
-        """Infer the number of tokens from KV cache tensor shapes."""
-        if not self.kv_cache:
+        """Infer num_tokens from the stacked KV cache (computed lazily).
+        
+        This uses get_stacked_kv() which normalizes all formats to:
+        [num_layers, num_kv_heads, seq_len, head_dim]
+        So seq_len is always at index 2.
+        """
+        stacked = self.get_stacked_kv()
+        if stacked is None or len(stacked) == 0:
             return 0
-        
-        # Get first KV cache tensor
-        first_key = next(iter(self.kv_cache.keys()))
-        first_tensor = self.kv_cache[first_key]
-        
-        if not isinstance(first_tensor, torch.Tensor):
-            return 0
-        
-        # KV cache shape is typically (num_heads, seq_len, head_dim)
-        # or (batch, num_heads, seq_len, head_dim)
-        if first_tensor.dim() >= 3:
-            # seq_len is the second-to-last dimension
-            return first_tensor.shape[-2]
-        elif first_tensor.dim() == 2:
-            # Ambiguous - try to guess
-            return max(first_tensor.shape)
-        
-        return 0
+        # Stacked shape: [num_layers, num_kv_heads, seq_len, head_dim]
+        return stacked[0].shape[2]
     
     def has_valid_token_ids(self) -> bool:
         """Check if this cartridge has valid token IDs for prepending."""
