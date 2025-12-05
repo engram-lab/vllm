@@ -607,8 +607,6 @@ class FlashAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_seqs = attn_metadata.query_start_loc.shape[0] - 1
         
-        layer_name = getattr(layer, 'layer_name', '')
-        
         # Get cartridge sequence length
         # Input shape is (num_kv_heads, seq_len, head_size)
         cartridge_seq_len = cartridge_k.shape[1]
@@ -677,10 +675,6 @@ class FlashAttentionImpl(AttentionImpl):
         scheduler_metadata = attn_metadata.scheduler_metadata
         descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
         
-        # Debug logging for suffix attention (layer 0 only)
-        if 'layers.0' in layer_name:
-            logger.info(f"[CARTRIDGE SUFFIX] seqused_k={seqused_k.tolist() if hasattr(seqused_k, 'tolist') else seqused_k}, "
-                       f"max_seqlen_k={max_seqlen_k}, causal={attn_metadata.causal}")
         
         suffix_output, suffix_lse = flash_attn_varlen_func(
             q=query[:num_actual_tokens],
@@ -708,18 +702,8 @@ class FlashAttentionImpl(AttentionImpl):
         
         # Merge cartridge and suffix attention outputs using log-sum-exp
         # FA returns LSE in shape [num_heads, num_tokens] which merge_attn_states expects
-        
-        # Debug logging for merge (layer 0 only)
-        if 'layers.0' in layer_name:
-            cart_lse_t = cartridge_lse.transpose(0, 1).contiguous()
-            suff_lse_t = suffix_lse.transpose(0, 1).contiguous()
-            logger.info(f"[CARTRIDGE MERGE] cartridge_lse shape={cart_lse_t.shape}, "
-                       f"mean={cart_lse_t.mean().item():.3f}, "
-                       f"suffix_lse shape={suff_lse_t.shape}, "
-                       f"mean={suff_lse_t.mean().item():.3f}")
-        else:
-            cart_lse_t = cartridge_lse.transpose(0, 1).contiguous()
-            suff_lse_t = suffix_lse.transpose(0, 1).contiguous()
+        cart_lse_t = cartridge_lse.transpose(0, 1).contiguous()
+        suff_lse_t = suffix_lse.transpose(0, 1).contiguous()
         
         merge_attn_states(
             output[:num_actual_tokens],

@@ -294,7 +294,7 @@ class OpenAIServing:
         cartridges: list[dict[str, Any]] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
-    ) -> tuple[list[int], list["torch.Tensor"] | None]:
+    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None]:
         """
         Load cartridges and process them for the request.
 
@@ -312,11 +312,12 @@ class OpenAIServing:
               or original prompt_token_ids (for learned cartridges)
             - Stacked cartridge KV tensors [keys, values] for learned cartridges,
               or None if no learned cartridge
+            - Cartridge ID for deduplication, or None if no learned cartridge
         """
         import torch
         
         if not cartridges:
-            return prompt_token_ids, None
+            return prompt_token_ids, None, None
 
         from vllm.logger import init_logger
         from vllm.v1.cartridge_loader import (
@@ -331,11 +332,14 @@ class OpenAIServing:
 
             # Separate learned and pre-computed cartridges
             learned_cartridges = []
+            learned_cartridge_ids = []
             precomputed_cartridges = []
             
-            for cartridge_data in loaded_cartridges:
+            for i, cartridge_data in enumerate(loaded_cartridges):
                 if cartridge_data.is_learned:
                     learned_cartridges.append(cartridge_data)
+                    # Get cartridge ID from original spec
+                    learned_cartridge_ids.append(cartridges[i].get("id", f"unknown_{i}"))
                 elif cartridge_data.has_valid_token_ids():
                     precomputed_cartridges.append(cartridge_data)
                 else:
@@ -345,6 +349,7 @@ class OpenAIServing:
             
             # Handle learned cartridges - get stacked tensors for IPC (cached)
             stacked_cartridge_kv: list[torch.Tensor] | None = None
+            cartridge_id: str | None = None
             if learned_cartridges:
                 # Currently only supports one learned cartridge per request
                 if len(learned_cartridges) > 1:
@@ -354,6 +359,7 @@ class OpenAIServing:
                     )
                 
                 cartridge_data = learned_cartridges[0]
+                cartridge_id = learned_cartridge_ids[0]
                 
                 # Get stacked KV tensors (computed once, then cached)
                 stacked_cartridge_kv = cartridge_data.get_stacked_kv()
@@ -368,9 +374,9 @@ class OpenAIServing:
                     f"Prepending {len(cartridge_token_ids)} tokens from "
                     f"{len(precomputed_cartridges)} pre-computed cartridge(s) to prompt"
                 )
-                return cartridge_token_ids + prompt_token_ids, stacked_cartridge_kv
+                return cartridge_token_ids + prompt_token_ids, stacked_cartridge_kv, cartridge_id
             else:
-                return prompt_token_ids, stacked_cartridge_kv
+                return prompt_token_ids, stacked_cartridge_kv, cartridge_id
 
         except Exception as e:
             logger.error(f"Failed to process cartridges: {e}")
@@ -1295,6 +1301,7 @@ class OpenAIServing:
         trace_headers: Mapping[str, str] | None,
         priority: int,
         cartridge_kv: list[torch.Tensor] | None = None,
+        cartridge_id: str | None = None,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
         """Use the Processor to process inputs for AsyncLLM."""
         tokenization_kwargs: dict[str, Any] = {}
@@ -1311,6 +1318,7 @@ class OpenAIServing:
             trace_headers=trace_headers,
             priority=priority,
             cartridge_kv=cartridge_kv,
+            cartridge_id=cartridge_id,
         )
         return engine_request, tokenization_kwargs
 

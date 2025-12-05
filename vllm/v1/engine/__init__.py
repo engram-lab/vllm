@@ -64,6 +64,8 @@ class EngineCoreRequest(
     # Shape: (num_layers, num_kv_heads, seq_len, head_dim) for each tensor.
     # This is a list [keys_stacked, values_stacked] where each is a stacked tensor.
     cartridge_kv: list[torch.Tensor] | None = None
+    # Cartridge identifier for deduplication across IPC
+    cartridge_id: str | None = None
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.

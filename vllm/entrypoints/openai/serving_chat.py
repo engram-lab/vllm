@@ -321,9 +321,10 @@ class OpenAIServingChat(OpenAIServing):
 
                 # Process cartridges if present
                 cartridge_kv = None
+                cartridge_id = None
                 if request.cartridges:
                     cartridge_dicts = [c.model_dump() for c in request.cartridges]
-                    engine_prompt["prompt_token_ids"], cartridge_kv = self._process_cartridges(
+                    engine_prompt["prompt_token_ids"], cartridge_kv, cartridge_id = self._process_cartridges(
                         cartridge_dicts,
                         engine_prompt["prompt_token_ids"],
                         request_id=sub_request_id,
@@ -346,6 +347,7 @@ class OpenAIServingChat(OpenAIServing):
                         trace_headers=trace_headers,
                         priority=request.priority,
                         cartridge_kv=cartridge_kv,
+                        cartridge_id=cartridge_id,
                     )
 
                     generator = self.engine_client.generate(
