@@ -607,41 +607,37 @@ class FlashAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_seqs = attn_metadata.query_start_loc.shape[0] - 1
         
-        # Log cartridge attention (only for layer 0 to avoid spam)
         layer_name = getattr(layer, 'layer_name', '')
-        # if 'layers.0' in layer_name:
-            # logger.info(f"[CARTRIDGE ATTN] Input cartridge_k shape: {cartridge_k.shape}, "
-            #            f"num_seqs={num_seqs}, num_query_tokens={num_actual_tokens}, "
-            #            f"query_start_loc={attn_metadata.query_start_loc.tolist()}, "
-            #            f"query shape: {query.shape}")
         
         # Get cartridge sequence length
         # Input shape is (num_kv_heads, seq_len, head_size)
         cartridge_seq_len = cartridge_k.shape[1]
         
-        # Reshape cartridge KV to match flash attention format
-        # From (num_kv_heads, seq_len, head_size) to (seq_len, num_kv_heads, head_size)
-        cartridge_k = cartridge_k.transpose(0, 1).contiguous().to(query.dtype)
-        cartridge_v = cartridge_v.transpose(0, 1).contiguous().to(query.dtype)
+        # Reshape cartridge KV to flash attention format: (seq_len, num_kv_heads, head_size)
+        # Use .to() with non_blocking for async dtype conversion
+        cartridge_k_t = cartridge_k.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
+        cartridge_v_t = cartridge_v.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
         
-        # For cartridge attention, we need to replicate the cartridge for each sequence
-        # and use non-causal attention so all queries attend to all cartridge positions
-        
-        # Build cu_seqlens for cartridge (each seq has same cartridge length)
-        cu_seqlens_k_cartridge = torch.arange(
-            0, (num_seqs + 1) * cartridge_seq_len, cartridge_seq_len,
-            device=query.device, dtype=torch.int32
-        )
-        
-        # Replicate cartridge KV for each sequence in the batch
-        # Shape: (num_seqs * cartridge_seq_len, num_kv_heads, head_size)
-        # Note: expand() creates a non-contiguous view, need contiguous() before reshape()
-        cartridge_k_batch = cartridge_k.unsqueeze(0).expand(num_seqs, -1, -1, -1).contiguous().reshape(
-            num_seqs * cartridge_seq_len, self.num_kv_heads, self.head_size
-        )
-        cartridge_v_batch = cartridge_v.unsqueeze(0).expand(num_seqs, -1, -1, -1).contiguous().reshape(
-            num_seqs * cartridge_seq_len, self.num_kv_heads, self.head_size
-        )
+        # For cartridge attention, each sequence attends to the same cartridge KV.
+        # Optimize for common single-sequence case to avoid memory allocation.
+        if num_seqs == 1:
+            # Single sequence - no replication needed
+            cartridge_k_batch = cartridge_k_t
+            cartridge_v_batch = cartridge_v_t
+            cu_seqlens_k_cartridge = torch.tensor(
+                [0, cartridge_seq_len], device=query.device, dtype=torch.int32
+            )
+        else:
+            # Multiple sequences - replicate cartridge for each
+            # Build cu_seqlens for cartridge (each seq has same cartridge length)
+            cu_seqlens_k_cartridge = torch.arange(
+                0, (num_seqs + 1) * cartridge_seq_len, cartridge_seq_len,
+                device=query.device, dtype=torch.int32
+            )
+            # Replicate: (seq_len, num_kv_heads, head_size) -> (num_seqs * seq_len, num_kv_heads, head_size)
+            # Using repeat() is more memory-efficient than expand().contiguous().reshape()
+            cartridge_k_batch = cartridge_k_t.repeat(num_seqs, 1, 1)
+            cartridge_v_batch = cartridge_v_t.repeat(num_seqs, 1, 1)
         
         # Run attention over cartridge KV (non-causal)
         cartridge_output, cartridge_lse = flash_attn_varlen_func(

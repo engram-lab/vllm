@@ -405,9 +405,15 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
-        # Cartridge KV cache for learned cartridge injection.
-        # Maps request_id -> dict[layer_idx, (key, value)]
-        self.cartridge_kv_cache: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        # Cartridge KV references for learned cartridge injection.
+        # Maps request_id -> (stacked_keys, stacked_values) - just references, no copy.
+        # Multiple requests using the same cartridge share the same tensor objects.
+        # Shape per tensor: (num_layers, num_kv_heads, seq_len, head_dim)
+        self.cartridge_kv_refs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Shared GPU cartridge cache - avoids re-transferring the same cartridge to GPU.
+        # Key: data_ptr of the source tensor (unique per cartridge)
+        # Value: dict[layer_idx, (key_gpu, value_gpu)]
+        self._gpu_cartridge_cache: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         # Position offset for cartridge requests (for RoPE only, not token indexing)
         # Maps request_id -> cartridge_seq_len
         self.cartridge_position_offsets: dict[str, int] = {}
@@ -727,12 +733,22 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
         
-        # Clear any active cartridge KV and position offsets for finished requests.
+        # Clear any active cartridge KV refs and position offsets for finished requests.
         for req_id in scheduler_output.finished_req_ids:
-            if req_id in self.cartridge_kv_cache:
-                del self.cartridge_kv_cache[req_id]
+            if req_id in self.cartridge_kv_refs:
+                del self.cartridge_kv_refs[req_id]
             if req_id in self.cartridge_position_offsets:
                 del self.cartridge_position_offsets[req_id]
+        
+        # Clean up GPU cartridge cache entries that are no longer referenced.
+        # A cartridge is still needed if any active request references it.
+        if self._gpu_cartridge_cache:
+            active_data_ptrs = {
+                kv[0].data_ptr() for kv in self.cartridge_kv_refs.values()
+            }
+            stale_keys = [k for k in self._gpu_cartridge_cache if k not in active_data_ptrs]
+            for k in stale_keys:
+                del self._gpu_cartridge_cache[k]
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -793,26 +809,19 @@ class GPUModelRunner(
             )
             self.requests[req_id] = req_state
 
-            # Store cartridge KV if present
+            # Store cartridge KV reference if present - just a reference, no copy.
+            # Multiple requests using the same cartridge share the same tensor objects.
             if new_req_data.cartridge_kv is not None:
                 stacked_keys, stacked_values = new_req_data.cartridge_kv
-                # Convert stacked format to per-layer dict
-                # Shape: (num_layers, num_heads, seq_len, head_dim)
-                layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-                num_layers = stacked_keys.shape[0]
+                # Just store the reference - CartridgeData.get_stacked_kv() already caches
+                self.cartridge_kv_refs[req_id] = (stacked_keys, stacked_values)
                 cartridge_seq_len = stacked_keys.shape[2]
-                for layer_idx in range(num_layers):
-                    layer_kv[layer_idx] = (
-                        stacked_keys[layer_idx].to(self.device),
-                        stacked_values[layer_idx].to(self.device),
-                    )
-                self.cartridge_kv_cache[req_id] = layer_kv
                 # Store position offset for RoPE - input tokens should have RoPE positions
                 # starting AFTER the cartridge (at position cartridge_seq_len)
                 self.cartridge_position_offsets[req_id] = cartridge_seq_len
-                logger.info(f"[CARTRIDGE] Stored KV for request {req_id}: "
-                           f"{num_layers} layers, seq_len={cartridge_seq_len}, "
-                           f"rope_position_offset={cartridge_seq_len}")
+                logger.info(f"[CARTRIDGE] Stored KV ref for request {req_id}: "
+                           f"{stacked_keys.shape[0]} layers, seq_len={cartridge_seq_len}, "
+                           f"data_ptr={stacked_keys.data_ptr()}")
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -996,30 +1005,57 @@ class GPUModelRunner(
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
         """Get cartridge KV for the current batch if any requests have active cartridges.
         
+        Uses a shared GPU cache to avoid re-transferring the same cartridge.
+        Multiple requests using the same cartridge will share the GPU tensors.
+        
         Returns:
-            Dictionary mapping layer index to (key, value) tensors, or None
+            Dictionary mapping layer index to (key, value) tensors on GPU, or None
             if no requests have active cartridges.
         """
-        # Check all scheduled requests for active cartridge KV in local cache
-        merged_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
-        
         scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
         
+        # Find the first request with an active cartridge
+        active_cartridge: tuple[torch.Tensor, torch.Tensor] | None = None
+        active_req_id: str | None = None
+        
         for req_id in scheduled_req_ids:
-            cartridge_kv = self.cartridge_kv_cache.get(req_id)
-            if cartridge_kv is not None:
-                if merged_kv is None:
-                    # First cartridge found - use it directly
-                    merged_kv = cartridge_kv
+            cartridge_ref = self.cartridge_kv_refs.get(req_id)
+            if cartridge_ref is not None:
+                if active_cartridge is None:
+                    active_cartridge = cartridge_ref
+                    active_req_id = req_id
                 else:
-                    # Multiple cartridges - for now we only support one
+                    # Multiple cartridges - for now we only support one per batch
                     logger.warning(
                         "Multiple requests have active cartridges. "
                         "Only the first cartridge will be used."
                     )
                     break
         
-        return merged_kv
+        if active_cartridge is None:
+            return None
+        
+        stacked_keys, stacked_values = active_cartridge
+        cache_key = stacked_keys.data_ptr()
+        
+        # Check GPU cache first
+        if cache_key in self._gpu_cartridge_cache:
+            return self._gpu_cartridge_cache[cache_key]
+        
+        # Transfer to GPU and cache
+        num_layers = stacked_keys.shape[0]
+        layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for layer_idx in range(num_layers):
+            layer_kv[layer_idx] = (
+                stacked_keys[layer_idx].to(self.device, non_blocking=True),
+                stacked_values[layer_idx].to(self.device, non_blocking=True),
+            )
+        
+        self._gpu_cartridge_cache[cache_key] = layer_kv
+        logger.info(f"[CARTRIDGE] Transferred to GPU for request {active_req_id}: "
+                   f"{num_layers} layers, cache_key={cache_key}")
+        
+        return layer_kv
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
