@@ -578,6 +578,7 @@ class FlashAttentionImpl(AttentionImpl):
         import re
         match = re.search(r'layers\.(\d+)', layer_name)
         if match is None:
+            logger.warning(f"[CARTRIDGE] Could not extract layer index from layer_name='{layer_name}'")
             return None
         
         layer_idx = int(match.group(1))
@@ -606,6 +607,14 @@ class FlashAttentionImpl(AttentionImpl):
         cartridge_k, cartridge_v = cartridge_kv
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_seqs = attn_metadata.query_start_loc.shape[0] - 1
+        
+        # Handle shape: cartridge may be (seq_len, num_kv_heads, head_size) 
+        # or (num_kv_heads, seq_len, head_size). We need (num_kv_heads, seq_len, head_size).
+        # Detect by checking if shape[0] matches num_kv_heads
+        if cartridge_k.shape[0] != self.num_kv_heads and cartridge_k.shape[1] == self.num_kv_heads:
+            # Shape is (seq_len, num_kv_heads, head_size) - need to transpose
+            cartridge_k = cartridge_k.transpose(0, 1).contiguous()
+            cartridge_v = cartridge_v.transpose(0, 1).contiguous()
         
         # Get cartridge sequence length
         # Input shape is (num_kv_heads, seq_len, head_size)
@@ -702,15 +711,12 @@ class FlashAttentionImpl(AttentionImpl):
         
         # Merge cartridge and suffix attention outputs using log-sum-exp
         # FA returns LSE in shape [num_heads, num_tokens] which merge_attn_states expects
-        cart_lse_t = cartridge_lse.transpose(0, 1).contiguous()
-        suff_lse_t = suffix_lse.transpose(0, 1).contiguous()
-        
         merge_attn_states(
             output[:num_actual_tokens],
             cartridge_output,
-            cart_lse_t,
+            cartridge_lse,
             suffix_output,
-            suff_lse_t,
+            suffix_lse,
         )
         
         return output
