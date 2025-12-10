@@ -555,6 +555,12 @@ class FlashAttentionImpl(AttentionImpl):
                 "heads in the layer"
             )
 
+        # Pre-allocated buffers for CUDA graph compatibility in cartridge path.
+        # These are lazily initialized on first use to capture correct device/dtype.
+        self._cartridge_cu_seqlens: torch.Tensor | None = None
+        self._cartridge_k_buffer: torch.Tensor | None = None
+        self._cartridge_v_buffer: torch.Tensor | None = None
+
     def supports_quant_query_input(self) -> bool:
         return True
 
@@ -602,61 +608,73 @@ class FlashAttentionImpl(AttentionImpl):
         2. Attention over the regular KV cache (suffix)
         Then merges the results using log-sum-exp weights.
         
-        The cartridge KV acts like a "soft prompt" that all tokens can attend to.
+        Uses pre-allocated buffers for CUDA graph compatibility.
         """
         cartridge_k, cartridge_v = cartridge_kv
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_seqs = attn_metadata.query_start_loc.shape[0] - 1
         
-        # Handle shape: cartridge may be (seq_len, num_kv_heads, head_size) 
-        # or (num_kv_heads, seq_len, head_size). We need (num_kv_heads, seq_len, head_size).
-        # Detect by checking if shape[0] matches num_kv_heads
+        # Normalize shape to (num_kv_heads, seq_len, head_size)
         if cartridge_k.shape[0] != self.num_kv_heads and cartridge_k.shape[1] == self.num_kv_heads:
-            # Shape is (seq_len, num_kv_heads, head_size) - need to transpose
             cartridge_k = cartridge_k.transpose(0, 1).contiguous()
             cartridge_v = cartridge_v.transpose(0, 1).contiguous()
         
-        # Get cartridge sequence length
-        # Input shape is (num_kv_heads, seq_len, head_size)
         cartridge_seq_len = cartridge_k.shape[1]
+        total_cartridge_tokens = num_seqs * cartridge_seq_len
         
-        # Reshape cartridge KV to flash attention format: (seq_len, num_kv_heads, head_size)
-        # Use .to() with non_blocking for async dtype conversion
-        cartridge_k_t = cartridge_k.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
-        cartridge_v_t = cartridge_v.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
+        # Reshape to flash attention format: (seq_len, num_kv_heads, head_size)
+        cartridge_k_t = cartridge_k.transpose(0, 1).contiguous().to(query.dtype)
+        cartridge_v_t = cartridge_v.transpose(0, 1).contiguous().to(query.dtype)
         
-        # For cartridge attention, each sequence attends to the same cartridge KV.
-        # Optimize for common single-sequence case to avoid memory allocation.
-        if num_seqs == 1:
-            # Single sequence - no replication needed
-            cartridge_k_batch = cartridge_k_t
-            cartridge_v_batch = cartridge_v_t
-            cu_seqlens_k_cartridge = torch.tensor(
-                [0, cartridge_seq_len], device=query.device, dtype=torch.int32
+        # Use pre-allocated buffers for CUDA graph compatibility.
+        # Buffers are allocated once (during graph capture) and reused.
+        if (self._cartridge_cu_seqlens is None or 
+            self._cartridge_cu_seqlens.shape[0] < num_seqs + 1):
+            # Allocate with some headroom to avoid reallocation
+            max_seqs = max(num_seqs * 2, 64)
+            self._cartridge_cu_seqlens = torch.zeros(
+                max_seqs + 1, device=query.device, dtype=torch.int32
             )
-        else:
-            # Multiple sequences - replicate cartridge for each
-            # Build cu_seqlens for cartridge (each seq has same cartridge length)
-            cu_seqlens_k_cartridge = torch.arange(
-                0, (num_seqs + 1) * cartridge_seq_len, cartridge_seq_len,
-                device=query.device, dtype=torch.int32
+        
+        if (self._cartridge_k_buffer is None or
+            self._cartridge_k_buffer.shape[0] < total_cartridge_tokens):
+            max_tokens = max(total_cartridge_tokens * 2, 256 * cartridge_seq_len)
+            self._cartridge_k_buffer = torch.empty(
+                max_tokens, self.num_kv_heads, self.head_size,
+                device=query.device, dtype=query.dtype
             )
-            # Replicate: (seq_len, num_kv_heads, head_size) -> (num_seqs * seq_len, num_kv_heads, head_size)
-            # Using repeat() is more memory-efficient than expand().contiguous().reshape()
-            cartridge_k_batch = cartridge_k_t.repeat(num_seqs, 1, 1)
-            cartridge_v_batch = cartridge_v_t.repeat(num_seqs, 1, 1)
+            self._cartridge_v_buffer = torch.empty(
+                max_tokens, self.num_kv_heads, self.head_size,
+                device=query.device, dtype=query.dtype
+            )
+        
+        # Update cu_seqlens in-place (fixed addresses, variable values)
+        cu_seqlens = self._cartridge_cu_seqlens[:num_seqs + 1]
+        cu_seqlens.copy_(torch.arange(
+            0, (num_seqs + 1) * cartridge_seq_len, cartridge_seq_len,
+            device=query.device, dtype=torch.int32
+        ))
+        
+        # Update K/V buffers in-place by copying replicated cartridge
+        k_buffer = self._cartridge_k_buffer[:total_cartridge_tokens]
+        v_buffer = self._cartridge_v_buffer[:total_cartridge_tokens]
+        for i in range(num_seqs):
+            start = i * cartridge_seq_len
+            end = start + cartridge_seq_len
+            k_buffer[start:end].copy_(cartridge_k_t)
+            v_buffer[start:end].copy_(cartridge_v_t)
         
         # Run attention over cartridge KV (non-causal)
         cartridge_output, cartridge_lse = flash_attn_varlen_func(
             q=query[:num_actual_tokens],
-            k=cartridge_k_batch,
-            v=cartridge_v_batch,
+            k=k_buffer,
+            v=v_buffer,
             cu_seqlens_q=attn_metadata.query_start_loc,
-            cu_seqlens_k=cu_seqlens_k_cartridge,
+            cu_seqlens_k=cu_seqlens,
             max_seqlen_q=attn_metadata.max_query_len,
             max_seqlen_k=cartridge_seq_len,
             softmax_scale=self.scale,
-            causal=False,  # Cartridge attention is non-causal
+            causal=False,
             return_softmax_lse=True,
             fa_version=self.vllm_flash_attn_version,
         )

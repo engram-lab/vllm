@@ -77,17 +77,25 @@ class CudagraphDispatcher:
         else:
             lora_cases = [False]
 
+        # Capture both with and without cartridge for mixed workloads
+        cartridge_cases = [False, True]
+
         # Note: we create all valid keys for cudagraph here but do not
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
         if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
-            for bs, has_lora in product(
-                self.compilation_config.cudagraph_capture_sizes, lora_cases
+            for bs, has_lora, has_cartridge in product(
+                self.compilation_config.cudagraph_capture_sizes,
+                lora_cases,
+                cartridge_cases,
             ):
                 self.add_cudagraph_key(
                     cudagraph_mode.mixed_mode(),
                     BatchDescriptor(
-                        num_tokens=bs, uniform_decode=False, has_lora=has_lora
+                        num_tokens=bs,
+                        uniform_decode=False,
+                        has_lora=has_lora,
+                        has_cartridge=has_cartridge,
                     ),
                 )
 
@@ -106,11 +114,16 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
-            for bs, has_lora in product(cudagraph_capture_sizes_for_decode, lora_cases):
+            for bs, has_lora, has_cartridge in product(
+                cudagraph_capture_sizes_for_decode, lora_cases, cartridge_cases
+            ):
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
                     BatchDescriptor(
-                        num_tokens=bs, uniform_decode=True, has_lora=has_lora
+                        num_tokens=bs,
+                        uniform_decode=True,
+                        has_lora=has_lora,
+                        has_cartridge=has_cartridge,
                     ),
                 )
         self.keys_initialized = True

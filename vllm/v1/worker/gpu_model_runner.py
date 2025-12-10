@@ -1071,6 +1071,21 @@ class GPUModelRunner(
         
         return layer_kv
 
+    def _get_dummy_cartridge_kv(self) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Create dummy cartridge KV for CUDA graph warmup/capture."""
+        num_layers = self.model_config.get_num_layers(self.parallel_config)
+        num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
+        head_size = self.model_config.get_head_size()
+        return {
+            i: (
+                torch.zeros(num_kv_heads, 16, head_size,
+                            device=self.device, dtype=self.dtype),
+                torch.zeros(num_kv_heads, 16, head_size,
+                            device=self.device, dtype=self.dtype),
+            )
+            for i in range(num_layers)
+        }
+
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
     ) -> None:
@@ -3005,10 +3020,14 @@ class GPUModelRunner(
             uniform_decode = (
                 max_num_scheduled_tokens == self.uniform_decode_query_len
             ) and (num_scheduled_tokens == num_reqs * max_num_scheduled_tokens)
+            # Get cartridge KV before BatchDescriptor for proper graph dispatch
+            cartridge_kv = self._get_cartridge_kv_for_batch(scheduler_output)
+
             batch_desc = BatchDescriptor(
                 num_tokens=num_input_tokens,
                 uniform_decode=uniform_decode,
                 has_lora=len(self.input_batch.lora_id_to_lora_request) > 0,
+                has_cartridge=cartridge_kv is not None,
             )
             cudagraph_runtime_mode, batch_descriptor = (
                 self.cudagraph_dispatcher.dispatch(
@@ -3026,10 +3045,6 @@ class GPUModelRunner(
             self.calculate_kv_scales = False
 
         # Run the model.
-        # Use persistent buffers for CUDA graphs.
-        # Get any active cartridge KV for the current requests
-        cartridge_kv = self._get_cartridge_kv_for_batch(scheduler_output)
-        
         with (
             set_forward_context(
                 attn_metadata,
@@ -3900,6 +3915,7 @@ class GPUModelRunner(
         create_mixed_batch: bool = False,
         remove_lora: bool = True,
         activate_lora: bool = False,
+        activate_cartridge: bool = False,
         is_graph_capturing: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -4118,6 +4134,7 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     ubatch_slices=ubatch_slices,
+                    cartridge_kv=self._get_dummy_cartridge_kv() if activate_cartridge else None,
                 ),
             ):
                 outputs = self.model(
@@ -4466,11 +4483,18 @@ class GPUModelRunner(
             else:
                 lora_cases = [False]
 
+            # Capture both with and without cartridge for mixed workloads
+            cartridge_cases = [False, True]
+
             if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
                 cudagraph_runtime_mode = cudagraph_mode.mixed_mode()
                 # make sure we capture the largest batch size first
                 compilation_cases = list(
-                    product(reversed(self.cudagraph_batch_sizes), lora_cases)
+                    product(
+                        reversed(self.cudagraph_batch_sizes),
+                        lora_cases,
+                        cartridge_cases,
+                    )
                 )
                 self._capture_cudagraphs(
                     compilation_cases,
@@ -4493,7 +4517,11 @@ class GPUModelRunner(
                     if max_num_tokens >= x >= self.uniform_decode_query_len
                 ]
                 compilation_cases_decode = list(
-                    product(reversed(decode_cudagraph_batch_sizes), lora_cases)
+                    product(
+                        reversed(decode_cudagraph_batch_sizes),
+                        lora_cases,
+                        cartridge_cases,
+                    )
                 )
                 self._capture_cudagraphs(
                     compilation_cases=compilation_cases_decode,
@@ -4525,7 +4553,7 @@ class GPUModelRunner(
 
     def _capture_cudagraphs(
         self,
-        compilation_cases: list[tuple[int, bool]],
+        compilation_cases: list[tuple[int, bool, bool]],
         cudagraph_runtime_mode: CUDAGraphMode,
         uniform_decode: bool,
     ):
@@ -4546,7 +4574,7 @@ class GPUModelRunner(
             )
 
         # We skip EPLB here since we don't want to record dummy metrics
-        for num_tokens, activate_lora in compilation_cases:
+        for num_tokens, activate_lora, activate_cartridge in compilation_cases:
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
             # is above the threshold. Otherwise we just capture a non-ubatched
@@ -4578,6 +4606,7 @@ class GPUModelRunner(
                     skip_eplb=True,
                     remove_lora=False,
                     activate_lora=activate_lora,
+                    activate_cartridge=activate_cartridge,
                 )
             self._dummy_run(
                 num_tokens,
@@ -4587,6 +4616,7 @@ class GPUModelRunner(
                 skip_eplb=True,
                 remove_lora=False,
                 activate_lora=activate_lora,
+                activate_cartridge=activate_cartridge,
                 is_graph_capturing=True,
             )
         self.maybe_remove_all_loras(self.lora_config)
