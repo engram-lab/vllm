@@ -43,12 +43,7 @@ def _parse_kv_cache_to_layers(
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
     """Parse KV cache dict into keys_by_layer and values_by_layer.
     
-    Handles two input formats:
-    1. TrainableCache format: (1, num_kv_heads, seq_len, head_dim)
-       - This is how engrams/cartridges library saves trainable KV caches
-    2. Legacy format: (1, seq_len, num_kv_heads, head_dim)
-       - Some older cartridge formats may use this
-    
+    Input shape from TrainableCache: (1, seq_len, num_kv_heads, head_dim)
     Output shape per tensor: (num_kv_heads, seq_len, head_dim)
     """
     keys_by_layer: dict[int, torch.Tensor] = {}
@@ -62,53 +57,9 @@ def _parse_kv_cache_to_layers(
         layer_idx = int(match.group(1))
         kv_type = match.group(2)
         
-        # Transform 4D tensor to 3D (num_kv_heads, seq_len, head_dim)
+        # Transform: (1, seq_len, num_kv_heads, head_dim) -> (num_kv_heads, seq_len, head_dim)
         if tensor.dim() == 4:
-            # After squeeze(0), we have shape (A, B, C) where we need to figure out
-            # if this is (num_kv_heads, seq_len, head_dim) or (seq_len, num_kv_heads, head_dim)
-            # 
-            # TrainableCache saves as (1, num_kv_heads, seq_len, head_dim)
-            # So squeeze(0) gives (num_kv_heads, seq_len, head_dim) - already correct!
-            #
-            # Legacy format was (1, seq_len, num_kv_heads, head_dim)
-            # So squeeze(0) gives (seq_len, num_kv_heads, head_dim) - needs permute
-            #
-            # Heuristic: head_dim is typically 64, 128, etc. and is almost always 
-            # the last dimension. num_kv_heads is typically 1-128. seq_len can vary.
-            # If dim[0] < dim[1] and dim[2] looks like head_dim, it's TrainableCache format.
-            tensor = tensor.squeeze(0)
-            dim0, dim1, dim2 = tensor.shape
-            
-            # TrainableCache format: (num_kv_heads, seq_len, head_dim)
-            # - dim0 (num_kv_heads) is typically small (1-128)
-            # - dim1 (seq_len) is the cartridge length
-            # - dim2 (head_dim) is typically 64, 128, etc.
-            # 
-            # Legacy format: (seq_len, num_kv_heads, head_dim)
-            # - In this case, we need dim1 < dim0 AND dim1 looks like num_heads
-            #
-            # Best heuristic: if dim0 is a common num_heads value (power of 2, <= 128)
-            # and dim2 is a common head_dim (64, 128, 256), assume TrainableCache format
-            is_trainable_cache_format = (
-                dim0 <= 128 and  # num_kv_heads is typically small
-                dim0 > 0 and
-                (dim0 & (dim0 - 1)) == 0 and  # num_kv_heads is power of 2
-                dim2 in (64, 80, 96, 128, 256)  # common head_dim values
-            )
-            
-            if not is_trainable_cache_format:
-                # Legacy format: (seq_len, num_kv_heads, head_dim) -> (num_kv_heads, seq_len, head_dim)
-                logger.info(
-                    f"[CARTRIDGE] Detected legacy format for {key_name}: "
-                    f"shape {(dim0, dim1, dim2)} -> permuting to (num_kv_heads, seq_len, head_dim)"
-                )
-                tensor = tensor.permute(1, 0, 2)
-            else:
-                # TrainableCache format already in correct shape (num_kv_heads, seq_len, head_dim)
-                logger.info(
-                    f"[CARTRIDGE] Detected TrainableCache format for {key_name}: "
-                    f"shape {tensor.shape} already in (num_kv_heads, seq_len, head_dim)"
-                )
+            tensor = tensor.squeeze(0).permute(1, 0, 2)
         
         if device is not None:
             tensor = tensor.to(device)
