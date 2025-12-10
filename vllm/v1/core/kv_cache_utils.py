@@ -507,12 +507,19 @@ def generate_block_hash_extra_keys(
     cache_salt_keys: list[str] = (
         [request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []
     )
+    # Include cartridge_id in ALL blocks (not just first) because cartridge
+    # shifts RoPE positions for all tokens. Requests with the same cartridge
+    # can share prefix cache; different cartridges will have different hashes.
+    cartridge_keys: list[str] = (
+        [request.cartridge_id] if request.cartridge_id else []
+    )
     prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
 
     extra_keys: list[Any] = (
-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
+        lora_extra_keys + mm_extra_keys + cache_salt_keys + cartridge_keys
+        + prompt_embeds_keys
     )
 
     if not extra_keys:
