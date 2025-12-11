@@ -4022,6 +4022,7 @@ class GPUModelRunner(
                     num_tokens=num_tokens_after_padding,
                     uniform_decode=uniform_decode,
                     has_lora=activate_lora and self.lora_config is not None,
+                    has_cartridge=activate_cartridge,
                 )
             )
             if not is_profile
