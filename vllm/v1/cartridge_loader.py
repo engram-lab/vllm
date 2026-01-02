@@ -21,7 +21,7 @@ from typing import Any, Optional
 import torch
 
 from vllm.logger import init_logger
-from vllm.utils.cartridge_manager import get_cartridge_manager
+from vllm.utils.adapter_manager import get_adapter_manager
 
 logger = init_logger(__name__)
 
@@ -292,9 +292,9 @@ def load_cartridge(
     
     logger.info(f"Loading cartridge: {cartridge_id} (source={source})")
 
-    manager = get_cartridge_manager()
-    cartridge_tensor = manager.get_cartridge(
-        cartridge_id=cartridge_id,
+    manager = get_adapter_manager()
+    cartridge_tensor = manager.get_adapter(
+        adapter_id=cartridge_id,
         source=source,
         force_redownload=force_redownload,
     )

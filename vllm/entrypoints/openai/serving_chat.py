@@ -319,16 +319,33 @@ class OpenAIServingChat(OpenAIServing):
                     else await self._get_trace_headers(raw_request.headers)
                 )
 
-                # Process cartridges if present
+                # Process adapters (prefix/lora) if present
                 cartridge_kv = None
                 cartridge_id = None
+                dynamic_lora_request = None
+                
+                # Convert adapters config to dict if present
+                adapters_dict = None
+                if request.adapters:
+                    adapters_dict = request.adapters.model_dump()
+                
+                # SH(1/1) Convert old cartridges format for backward compatibility
+                cartridges_list = None
                 if request.cartridges:
-                    cartridge_dicts = [c.model_dump() for c in request.cartridges]
-                    engine_prompt["prompt_token_ids"], cartridge_kv, cartridge_id = self._process_cartridges(
-                        cartridge_dicts,
-                        engine_prompt["prompt_token_ids"],
+                    cartridges_list = [c.model_dump() for c in request.cartridges]
+                
+                # Process all adapters (prefix + lora)
+                if adapters_dict or cartridges_list:
+                    engine_prompt["prompt_token_ids"], cartridge_kv, cartridge_id, dynamic_lora_request = self._process_adapters(
+                        adapters_config=adapters_dict,
+                        cartridges=cartridges_list,
+                        prompt_token_ids=engine_prompt["prompt_token_ids"],
                         request_id=sub_request_id,
                     )
+                
+                # Override with dynamic LoRA request if created
+                if dynamic_lora_request:
+                    lora_request = dynamic_lora_request
 
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.beam_search(

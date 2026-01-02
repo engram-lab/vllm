@@ -211,16 +211,34 @@ class OpenAIServingCompletion(OpenAIServing):
                 # but pre-commit in CI fails without it.
                 engine_prompt = cast(EmbedsPrompt | TokensPrompt, engine_prompt)
 
-                # Process cartridges if present
+                # Process adapters (prefix/lora) if present
                 cartridge_kv = None
                 cartridge_id = None
-                if request.cartridges and "prompt_token_ids" in engine_prompt:
-                    cartridge_dicts = [c.model_dump() for c in request.cartridges]
-                    engine_prompt["prompt_token_ids"], cartridge_kv, cartridge_id = self._process_cartridges(
-                        cartridge_dicts,
-                        engine_prompt["prompt_token_ids"],
-                        request_id=request_id_item,
-                    )
+                dynamic_lora_request = None
+                
+                if "prompt_token_ids" in engine_prompt:
+                    # Convert adapters config to dict if present
+                    adapters_dict = None
+                    if request.adapters:
+                        adapters_dict = request.adapters.model_dump()
+                    
+                    # SH(1/1) Convert old cartridges format for backward compatibility
+                    cartridges_list = None
+                    if request.cartridges:
+                        cartridges_list = [c.model_dump() for c in request.cartridges]
+                    
+                    # Process all adapters (prefix + lora)
+                    if adapters_dict or cartridges_list:
+                        engine_prompt["prompt_token_ids"], cartridge_kv, cartridge_id, dynamic_lora_request = self._process_adapters(
+                            adapters_config=adapters_dict,
+                            cartridges=cartridges_list,
+                            prompt_token_ids=engine_prompt["prompt_token_ids"],
+                            request_id=request_id_item,
+                        )
+                
+                # Override with dynamic LoRA request if created
+                if dynamic_lora_request:
+                    lora_request = dynamic_lora_request
 
                 if isinstance(sampling_params, BeamSearchParams):
                     generator = self.beam_search(

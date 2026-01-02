@@ -522,27 +522,49 @@ class ResponsesRequest(OpenAIBaseModel):
         return data
 
 
-class KVCacheCartridge(OpenAIBaseModel):
-    """KV cache cartridge specification for loading pre-computed KV caches."""
+class AdapterSpec(OpenAIBaseModel):
+    """Base specification for an adapter (prefix, LoRA, currently supported)."""
 
     id: str = Field(
         description=(
-            "The identifier/path to the cartridge. For S3 sources, this should be "
-            "an S3 URI (e.g., 's3://bucket/path/to/cartridge.pt'). "
+            "The identifier/path to the adapter. For S3 sources, this should be "
+            "an S3 URI (e.g., 's3://bucket/path/to/adapter'). "
             "For local sources, this should be a file path."
         ),
     )
     source: Literal["s3", "local"] = Field(
         default="s3",
-        description=("The source type of the cartridge. Currently supports 's3' and 'local'."),
+        description=("The source type of the adapter. Supports: s3, local, wandb, huggingface"),
     )
     force_redownload: bool = Field(
         default=False,
         description=(
-            "If true, force redownload the cartridge even if it exists in the cache. "
+            "If true, force redownload the adapter even if it exists in the cache. "
             "If false, use cached version if available."
         ),
     )
+
+
+class AdaptersConfig(OpenAIBaseModel):
+    """Configuration for multiple adapter types in a request."""
+    
+    prefix: list[AdapterSpec] | None = Field(
+        default=None,
+        description="List of prefix/cartridge adapters to load (learned KV cache)",
+    )
+    lora: list[AdapterSpec] | None = Field(
+        default=None,
+        description="List of LoRA adapters to load (low-rank weight deltas)",
+    )
+
+
+# SH(1/1) Backward compatibility alias
+class KVCacheCartridge(AdapterSpec):
+    """[DEPRECATED] Use AdapterSpec with adapters.prefix instead.
+    
+    KV cache cartridge specification for loading pre-computed KV caches.
+    This is kept for backward compatibility."""
+    pass
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
@@ -735,12 +757,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
+    adapters: AdaptersConfig | None = Field(
+        default=None,
+        description=(
+            "Adapters configuration for this request. Supports prefix (KV cache) "
+            "and LoRA adapters that can be loaded from S3, local storage, etc."
+        ),
+    )
+    
+    # SH(1/1) Backward compatibility - deprecated
     cartridges: list[KVCacheCartridge] | None = Field(
         default=None,
         description=(
-            "List of KV cache cartridges to load for this request. "
-            "Cartridges are pre-computed KV caches that can be loaded from "
-            "S3 or local storage to speed up inference."
+            "[DEPRECATED] Use 'adapters.prefix' instead. "
+            "List of KV cache cartridges to load for this request."
         ),
     )
 
@@ -1164,12 +1194,20 @@ class CompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
+    adapters: AdaptersConfig | None = Field(
+        default=None,
+        description=(
+            "Adapters configuration for this request. Supports prefix (KV cache) "
+            "and LoRA adapters that can be loaded from S3, local storage, etc."
+        ),
+    )
+    
+    # SH(1/1) Backward compatibility - deprecated
     cartridges: list[KVCacheCartridge] | None = Field(
         default=None,
         description=(
-            "List of KV cache cartridges to load for this request. "
-            "Cartridges are pre-computed KV caches that can be loaded from "
-            "S3 or local storage to speed up inference."
+            "[DEPRECATED] Use 'adapters.prefix' instead. "
+            "List of KV cache cartridges to load for this request."
         ),
     )
 
