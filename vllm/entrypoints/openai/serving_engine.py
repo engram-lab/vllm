@@ -530,10 +530,9 @@ class OpenAIServing:
             lora_request = LoRARequest(
                 lora_name=lora_id,  # Use full lora_id for better traceability
                 lora_int_id=lora_int_id,
-                lora_path=str(local_lora_dir),  # vLLM expects directory path
+                lora_path=f"{str(local_lora_dir)}/",  # vLLM expects directory path
             )
 
-            logger.info(f"Successfully created LoRARequest: {lora_request.lora_name}")
             return lora_request
 
         except Exception as e:
