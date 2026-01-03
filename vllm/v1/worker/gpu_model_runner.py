@@ -818,9 +818,8 @@ class GPUModelRunner(
                 # Store position offset for RoPE - input tokens should have RoPE positions
                 # starting AFTER the cartridge (at position cartridge_seq_len)
                 self.cartridge_position_offsets[req_id] = cartridge_seq_len
-                logger.debug(f"[CARTRIDGE] Stored KV ref for request {req_id}: "
-                            f"{stacked_keys.shape[0]} layers, seq_len={cartridge_seq_len}, "
-                            f"cartridge_id={cartridge_id}")
+                logger.debug(f"Stored cartridge KV for request {req_id}: "
+                            f"{stacked_keys.shape[0]} layers, seq_len={cartridge_seq_len}")
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -1066,8 +1065,7 @@ class GPUModelRunner(
             )
         
         self._gpu_cartridge_cache[cartridge_id] = layer_kv
-        logger.debug(f"[CARTRIDGE] Transferred to GPU for request {first_req_id}: "
-                    f"{num_layers} layers, cartridge_id={cartridge_id}")
+        logger.debug(f"Transferred cartridge to GPU: {num_layers} layers")
         
         return layer_kv
 

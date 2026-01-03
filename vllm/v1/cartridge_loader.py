@@ -94,11 +94,7 @@ def set_active_cartridge_kv(
     
     if layer_kv:
         _active_cartridge_kv[request_id] = layer_kv
-        first_layer = next(iter(layer_kv.values()))
-        logger.info(
-            f"[CARTRIDGE] Set KV for request {request_id}: "
-            f"{len(layer_kv)} layers, shape: {first_layer[0].shape}"
-        )
+        logger.info(f"Set cartridge KV for request {request_id}: {len(layer_kv)} layers")
 
 
 def get_active_cartridge_kv(
@@ -194,10 +190,7 @@ class CartridgeData:
                 torch.stack([keys_by_layer[i] for i in range(num_layers)]),
                 torch.stack([values_by_layer[i] for i in range(num_layers)]),
             ]
-            logger.info(
-                f"[CARTRIDGE] Computed stacked KV: "
-                f"keys={self._stacked_kv[0].shape}, values={self._stacked_kv[1].shape}"
-            )
+            logger.info(f"Computed stacked cartridge KV: {num_layers} layers")
         
         return self._stacked_kv
 
