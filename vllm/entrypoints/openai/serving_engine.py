@@ -511,9 +511,8 @@ class OpenAIServing:
             logger.info(f"[LoRA Debug] Local LoRA directory: {local_lora_dir} (hash={lora_hash})")
             
             local_lora_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"[LoRA Debug] Created/verified directory: {local_lora_dir}")
             
-            # Download both adapter_model.pt and adapter_config.json
+            # Download model.pt and lora_config.json from S3, save as adapter_model.pt and adapter_config.json (vLLM format)
             adapter_model_path = local_lora_dir / "adapter_model.pt"
             adapter_config_path = local_lora_dir / "adapter_config.json"
             
@@ -526,26 +525,26 @@ class OpenAIServing:
                 logger.info(f"[LoRA Debug] Downloading LoRA files (force_redownload={force_redownload})...")
                 
                 # lora_id should be a directory path (e.g., s3://bucket/path/to/checkpoint)
-                # We need to download adapter_model.pt from that directory
+                # We need to download model.pt from that directory (S3 naming)
                 
-                # Download adapter_model.pt
-                adapter_model_id = os.path.join(lora_id, "adapter_model.pt") if not lora_id.endswith(".pt") else lora_id
-                logger.info(f"[LoRA Debug] Downloading adapter_model.pt from: {adapter_model_id}")
+                # Download model.pt from S3, save as adapter_model.pt locally
+                adapter_model_id = os.path.join(lora_id, "model.pt") if not lora_id.endswith(".pt") else lora_id
+                logger.info(f"[LoRA Debug] Downloading model.pt from: {adapter_model_id}")
                 
                 lora_data = manager.get_adapter(
                     adapter_id=adapter_model_id,
                     source=lora_source,
                     force_redownload=force_redownload,
                 )
-                logger.info(f"[LoRA Debug] Downloaded LoRA weights, type={type(lora_data)}, keys={list(lora_data.keys()) if isinstance(lora_data, dict) else 'N/A'}")
+                logger.info(f"[LoRA Debug] Downloaded model.pt, type={type(lora_data)}, keys={list(lora_data.keys()) if isinstance(lora_data, dict) else 'N/A'}")
                 
                 torch.save(lora_data, adapter_model_path)
                 file_size_mb = adapter_model_path.stat().st_size / (1024 * 1024)
-                logger.info(f"[LoRA Debug] Saved LoRA weights to {adapter_model_path} (size: {file_size_mb:.2f} MB)")
+                logger.info(f"[LoRA Debug] Saved as adapter_model.pt to {adapter_model_path} (size: {file_size_mb:.2f} MB)")
                 
-                # Download adapter_config.json using AdapterManager
-                adapter_config_id = os.path.join(lora_id, "adapter_config.json")
-                logger.info(f"[LoRA Debug] Downloading adapter_config.json from: {adapter_config_id}")
+                # Download lora_config.json from S3, save as adapter_config.json locally (vLLM format)
+                adapter_config_id = os.path.join(lora_id, "lora_config.json")
+                logger.info(f"[LoRA Debug] Downloading lora_config.json from: {adapter_config_id}")
                 
                 try:
                     config_data = manager.download_json(
@@ -553,10 +552,10 @@ class OpenAIServing:
                         source=lora_source,
                         target_path=adapter_config_path,
                     )
-                    logger.info(f"[LoRA Debug] Downloaded adapter_config.json successfully")
+                    logger.info(f"[LoRA Debug] Downloaded lora_config.json and saved as adapter_config.json successfully")
                     logger.info(f"[LoRA Debug] Config contents: {config_data}")
                 except Exception as e:
-                    logger.warning(f"[LoRA Debug] Failed to download adapter_config.json: {e}. vLLM may fail to load LoRA.")
+                    logger.warning(f"[LoRA Debug] Failed to download lora_config.json: {e}. vLLM may fail to load LoRA.")
                     logger.warning(f"[LoRA Debug] Error type: {type(e).__name__}")
                     import traceback
                     logger.warning(f"[LoRA Debug] Traceback:\n{traceback.format_exc()}")
