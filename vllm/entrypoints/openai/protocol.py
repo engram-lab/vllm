@@ -557,16 +557,6 @@ class AdaptersConfig(OpenAIBaseModel):
         description="List of LoRA adapters to load (low-rank weight deltas)",
     )
 
-
-# SH(1/1) Backward compatibility alias
-class KVCacheCartridge(AdapterSpec):
-    """[DEPRECATED] Use AdapterSpec with adapters.prefix instead.
-    
-    KV cache cartridge specification for loading pre-computed KV caches.
-    This is kept for backward compatibility."""
-    pass
-
-
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -765,15 +755,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
         ),
     )
     
-    # SH(1/1) Backward compatibility - deprecated
-    cartridges: list[KVCacheCartridge] | None = Field(
-        default=None,
-        description=(
-            "[DEPRECATED] Use 'adapters.prefix' instead. "
-            "List of KV cache cartridges to load for this request."
-        ),
-    )
-
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
         description=(
@@ -1202,15 +1183,6 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
     
-    # SH(1/1) Backward compatibility - deprecated
-    cartridges: list[KVCacheCartridge] | None = Field(
-        default=None,
-        description=(
-            "[DEPRECATED] Use 'adapters.prefix' instead. "
-            "List of KV cache cartridges to load for this request."
-        ),
-    )
-
     vllm_xargs: dict[str, str | int | float] | None = Field(
         default=None,
         description=(

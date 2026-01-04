@@ -329,16 +329,10 @@ class OpenAIServingChat(OpenAIServing):
                 if request.adapters:
                     adapters_dict = request.adapters.model_dump()
                 
-                # SH(1/1) Convert old cartridges format for backward compatibility
-                cartridges_list = None
-                if request.cartridges:
-                    cartridges_list = [c.model_dump() for c in request.cartridges]
-                
                 # Process all adapters (prefix + lora)
-                if adapters_dict or cartridges_list:
+                if adapters_dict:
                     engine_prompt["prompt_token_ids"], cartridge_kv, cartridge_id, dynamic_lora_request = self._process_adapters(
                         adapters_config=adapters_dict,
-                        cartridges=cartridges_list,
                         prompt_token_ids=engine_prompt["prompt_token_ids"],
                         request_id=sub_request_id,
                     )

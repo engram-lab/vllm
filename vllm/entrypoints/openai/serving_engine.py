@@ -292,7 +292,6 @@ class OpenAIServing:
     def _process_adapters(
         self,
         adapters_config: dict[str, Any] | None,
-        cartridges: list[dict[str, Any]] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
     ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, LoRARequest | None]:
@@ -314,10 +313,6 @@ class OpenAIServing:
             - Prefix ID for deduplication, or None if no learned prefix
             - LoRARequest object if LoRA adapters specified, or None
         """
-        # SH(1/2) Backward compatibility: convert old cartridges to new adapters format
-        if cartridges and not adapters_config:
-            adapters_config = {"prefix": cartridges}
-        
         if not adapters_config:
             return prompt_token_ids, None, None, None
         
