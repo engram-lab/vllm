@@ -138,19 +138,115 @@ Each adapter directory must contain:
 5. The request is processed normally with the newly loaded adapter
 6. The adapter remains available for future requests
 
+### lora_s3_resolver
+
+The S3 resolver enables loading LoRA adapters directly from AWS S3 storage. This is useful for:
+- **Centralized Storage**: Store adapters in S3 for use across multiple vLLM instances
+- **Dynamic Loading**: Load adapters on-demand without pre-downloading
+- **Scalability**: Easy distribution of adapters to multiple servers
+
+#### Prerequisites
+
+1. **Install boto3**:
+   ```bash
+   ```
+
+2. **Configure AWS credentials**:
+   You can configure AWS credentials using any of these methods:
+   - AWS credentials file (`~/.aws/credentials`)
+   - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+   - IAM role (when running on EC2/ECS)
+
+#### Setup Steps
+
+1. **Upload your LoRA adapter to S3**:
+   ```bash
+   # Upload adapter directory to S3
+   aws s3 cp --recursive /path/to/local/adapter s3://my-bucket/lora-adapters/my_adapter/
+   ```
+
+2. **Verify S3 structure**:
+   ```bash
+   aws s3 ls s3://my-bucket/lora-adapters/my_adapter/
+   # Should show: adapter_config.json, adapter_model.bin, etc.
+   ```
+
+3. **Set environment variables**:
+   ```bash
+   export VLLM_ALLOW_RUNTIME_LORA_UPDATING=true
+   export VLLM_PLUGINS=lora_s3_resolver
+   export VLLM_LORA_RESOLVER_CACHE_DIR=/tmp/lora_cache
+   # AWS credentials (if not using IAM role)
+   export AWS_ACCESS_KEY_ID=your_access_key
+   export AWS_SECRET_ACCESS_KEY=your_secret_key
+   export AWS_DEFAULT_REGION=us-west-2
+   ```
+
+4. **Start vLLM server**:
+   ```bash
+   python -m vllm.entrypoints.openai.api_server \
+       --model meta-llama/Llama-2-7b-hf \
+       --enable-lora
+   ```
+
+#### Usage Example
+
+Make a request using an S3 path:
+
+```bash
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "s3://my-bucket/lora-adapters/my_adapter",
+        "prompt": "Generate a SQL query for:",
+        "max_tokens": 50,
+        "temperature": 0.1
+    }'
+```
+
+#### How It Works
+
+1. When vLLM receives a request with an S3 path (starting with `s3://`)
+2. The S3 resolver parses the S3 path and checks the local cache
+3. If not cached, it downloads all files from the S3 prefix to the cache directory
+4. It validates the `adapter_config.json` file
+5. If valid, the adapter is loaded and used for the request
+6. The cached adapter is reused for future requests
+
+#### S3 Path Format
+
+The S3 path should follow this format:
+```
+s3://bucket-name/path/to/adapter/
+```
+
+For example:
+- `s3://my-lora-bucket/adapters/sql-generator`
+- `s3://prod-models/team-a/custom-adapter-v2`
+
+#### Caching Behavior
+
+- Downloaded adapters are cached in `VLLM_LORA_RESOLVER_CACHE_DIR`
+- Cached adapters are reused across requests and server restarts
+- To force re-download, delete the cached directory
+- Cache directory structure mirrors S3 path (uses last path component as cache name)
+
 ## Advanced Configuration
 
 ### Multiple Resolvers
 
 You can configure multiple resolver plugins to load adapters from different sources:
 
-'lora_s3_resolver' is an example of a custom resolver you would need to implement
-
 ```bash
 export VLLM_PLUGINS=lora_filesystem_resolver,lora_s3_resolver
 ```
 
 All listed resolvers are enabled; at request time, vLLM tries them in order until one succeeds.
+
+For example, with both resolvers enabled:
+- If a request uses model name `"my_adapter"`, the filesystem resolver will check first
+- If a request uses model name `"s3://bucket/adapter"`, the filesystem resolver returns None, then the S3 resolver handles it
+- This allows mixing local and S3-based adapters in the same deployment
 
 ### Custom Resolver Implementation
 

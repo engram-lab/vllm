@@ -536,6 +536,22 @@ class KVCacheCartridge(OpenAIBaseModel):
         default="s3",
         description=("The source type of the cartridge. Currently supports 's3' and 'local'."),
     )
+    type: Literal["prefix", "lora"] | None = Field(
+        default=None,
+        description=(
+            "Type of adapter: 'prefix' for prefix/cartridge adapters, "
+            "'lora' for LoRA adapters. If not specified, the server will "
+            "attempt to infer the type or default based on context."
+        ),
+    )
+    type: Literal["prefix", "lora"] | None = Field(
+        default=None,
+        description=(
+            "Type of adapter: 'prefix' for prefix/cartridge adapters, "
+            "'lora' for LoRA adapters. If not specified, the server will "
+            "attempt to infer the type or default based on context."
+        ),
+    )
     force_redownload: bool = Field(
         default=False,
         description=(
