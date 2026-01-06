@@ -478,6 +478,7 @@ class OpenAIServing:
             lora_hash = hashlib.sha256(lora_id.encode()).hexdigest()[:16]
             local_lora_dir = Path(tempfile.gettempdir()) / "vllm_loras" / lora_hash
             local_lora_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"LoRA adapter storage directory: {local_lora_dir}")
             
             # Download model.pt and lora_config.json from S3, save as adapter_model.pt and adapter_config.json (vLLM format)
             adapter_model_path = local_lora_dir / "adapter_model.pt"
