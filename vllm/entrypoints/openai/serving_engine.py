@@ -492,7 +492,6 @@ class OpenAIServing:
                 
                 lora_data = manager.get_adapter(
                     adapter_id=adapter_model_id,
-                    source=lora_source,
                     force_redownload=force_redownload,
                 )
                 
@@ -504,7 +503,6 @@ class OpenAIServing:
                 try:
                     manager.download_json(
                         json_id=adapter_config_id,
-                        source=lora_source,
                         target_path=adapter_config_path,
                     )
                 except Exception as e:

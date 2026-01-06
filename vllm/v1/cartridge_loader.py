@@ -264,31 +264,34 @@ class CartridgeData:
 
 def load_cartridge(
     cartridge_id: str,
-    source: str = "s3",
     force_redownload: bool = False,
 ) -> CartridgeData:
     """Load a KV cache cartridge.
 
+    The cartridge_id can be either:
+    - S3 URI: s3://bucket/path/to/cartridge.pt
+    - Local path: /path/to/local/cartridge.pt
+
+    The Path abstraction automatically handles both cases.
+
     Args:
-        cartridge_id: The identifier/path of the cartridge
-        source: Source type ('s3' or 'local')
+        cartridge_id: The identifier/path of the cartridge (S3 URI or local path)
         force_redownload: If True, re-download even if cached
 
     Returns:
         CartridgeData containing the loaded cartridge
     """
-    cache_key = (cartridge_id, source)
+    cache_key = cartridge_id
     
     if not force_redownload and cache_key in _cartridge_data_cache:
         logger.debug(f"Using cached CartridgeData for: {cartridge_id}")
         return _cartridge_data_cache[cache_key]
     
-    logger.info(f"Loading cartridge: {cartridge_id} (source={source})")
+    logger.info(f"Loading cartridge: {cartridge_id}")
 
     manager = get_adapter_manager()
     cartridge_tensor = manager.get_adapter(
         adapter_id=cartridge_id,
-        source=source,
         force_redownload=force_redownload,
     )
 
@@ -319,7 +322,6 @@ def load_cartridges_from_request(
         try:
             cartridge_data = load_cartridge(
                 cartridge_id=cartridge_id,
-                source=spec.get("source", "s3"),
                 force_redownload=spec.get("force_redownload", False),
             )
             loaded_cartridges.append(cartridge_data)
