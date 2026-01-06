@@ -578,7 +578,7 @@ class FlashAttentionImpl(AttentionImpl):
         import re
         match = re.search(r'layers\.(\d+)', layer_name)
         if match is None:
-            logger.warning(f"[CARTRIDGE] Could not extract layer index from layer_name='{layer_name}'")
+            logger.warning(f"Could not extract layer index from layer_name='{layer_name}'")
             return None
         
         layer_idx = int(match.group(1))

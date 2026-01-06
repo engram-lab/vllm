@@ -289,6 +289,50 @@ class OpenAIServing:
         self.model_config = self.models.model_config
         self.max_model_len = self.model_config.max_model_len
 
+    def _process_adapters(
+        self,
+        adapters_config: dict[str, Any] | None,
+        prompt_token_ids: list[int],
+        request_id: str | None = None,
+    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, LoRARequest | None]:
+        """
+        Process all adapters (prefix, lora) from the request.
+
+        Args:
+            adapters_config: New adapters config with 'prefix' and 'lora' keys
+            cartridges: [DEPRECATED] Old cartridges format for backward compatibility
+            prompt_token_ids: Original prompt token IDs
+            request_id: Request ID to associate with adapters
+
+        Returns:
+            Tuple of:
+            - Combined token IDs with prefix tokens prepended (for pre-computed),
+              or original prompt_token_ids (for learned prefix)
+            - Stacked prefix KV tensors [keys, values] for learned prefix,
+              or None if no learned prefix
+            - Prefix ID for deduplication, or None if no learned prefix
+            - LoRARequest object if LoRA adapters specified, or None
+        """
+        if not adapters_config:
+            return prompt_token_ids, None, None, None
+        
+        # Process prefix adapters (cartridges)
+        prefix_specs = adapters_config.get("prefix")
+        prompt_token_ids, prefix_kv, prefix_id = self._process_cartridges(
+            cartridges=prefix_specs,
+            prompt_token_ids=prompt_token_ids,
+            request_id=request_id,
+        )
+        
+        # Process LoRA adapters
+        lora_specs = adapters_config.get("lora")
+        lora_request = self._process_lora(
+            lora_specs=lora_specs,
+            request_id=request_id,
+        )
+        
+        return prompt_token_ids, prefix_kv, prefix_id, lora_request
+
     def _process_cartridges(
         self,
         cartridges: list[dict[str, Any]] | None,
@@ -381,6 +425,113 @@ class OpenAIServing:
         except Exception as e:
             logger.error(f"Failed to process cartridges: {e}")
             raise RuntimeError(f"Failed to process cartridges: {e}") from e
+
+    def _process_lora(
+        self,
+        lora_specs: list[dict[str, Any]] | None,
+        request_id: str | None = None,
+    ) -> LoRARequest | None:
+        """
+        Process LoRA adapter specifications and create a LoRARequest.
+
+        Args:
+            lora_specs: List of LoRA adapter specifications from the request
+            request_id: Request ID to associate with the LoRA adapter
+
+        Returns:
+            LoRARequest object if LoRA adapters are specified, None otherwise
+        """
+        if not lora_specs:
+            return None
+
+        from vllm.logger import init_logger
+        from vllm.utils.adapter_manager import get_adapter_manager
+
+        logger = init_logger(__name__)
+
+        try:
+            # Only support one LoRA adapter per request
+            if len(lora_specs) > 1:
+                logger.warning(
+                    f"Multiple LoRA adapters detected ({len(lora_specs)}). "
+                    "Only the first one will be used."
+                )
+
+            lora_spec = lora_specs[0]
+            lora_id = lora_spec.get("id")
+            lora_source = lora_spec.get("source", "s3")
+            force_redownload = lora_spec.get("force_redownload", False)
+
+            if not lora_id:
+                logger.error("LoRA adapter spec missing 'id' field")
+                return None
+
+            # Download/load the LoRA adapter directory (contains adapter_model.pt + adapter_config.json)
+            manager = get_adapter_manager()
+            
+            import tempfile
+            import hashlib
+            from pathlib import Path
+            import os
+
+            # Create a unique local path for this LoRA adapter
+            lora_hash = hashlib.sha256(lora_id.encode()).hexdigest()[:16]
+            local_lora_dir = Path(tempfile.gettempdir()) / "vllm_loras" / lora_hash
+            local_lora_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"LoRA adapter storage directory: {local_lora_dir}")
+            
+            # Download model.pt and lora_config.json from S3, save as adapter_model.pt and adapter_config.json (vLLM format)
+            adapter_model_path = local_lora_dir / "adapter_model.pt"
+            adapter_config_path = local_lora_dir / "adapter_config.json"
+            
+            if not adapter_model_path.exists() or force_redownload:
+                # lora_id should be a directory path (e.g., s3://bucket/path/to/checkpoint)
+                # We need to download model.pt from that directory (S3 naming)
+                
+                # Download model.pt from S3, save as adapter_model.pt locally
+                adapter_model_id = os.path.join(lora_id, "model.pt") if not lora_id.endswith(".pt") else lora_id
+                
+                lora_data = manager.get_adapter(
+                    adapter_id=adapter_model_id,
+                    force_redownload=force_redownload,
+                )
+                
+                torch.save(lora_data, adapter_model_path)
+                
+                # Download lora_config.json from S3, save as adapter_config.json locally (vLLM format)
+                adapter_config_id = os.path.join(lora_id, "lora_config.json")
+                
+                try:
+                    manager.download_json(
+                        json_id=adapter_config_id,
+                        target_path=adapter_config_path,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to download lora_config.json: {e}. vLLM may fail to load LoRA.")
+
+            # Verify files exist before creating LoRARequest
+            if not adapter_model_path.exists():
+                raise FileNotFoundError(f"adapter_model.pt not found at {adapter_model_path}")
+            if not adapter_config_path.exists():
+                logger.warning(f"adapter_config.json not found at {adapter_config_path}, vLLM may fail to load LoRA")
+
+            # Create LoRARequest
+            # Generate a stable int ID based on lora_id only (not request_id)
+            # This ensures the same LoRA gets the same ID across all requests,
+            # allowing vLLM to reuse the loaded LoRA instead of reloading it
+            lora_int_id = hash(lora_id) & 0x7FFFFFFF  # Positive int
+            
+            lora_request = LoRARequest(
+                lora_name=lora_id,  # Use full lora_id for better traceability
+                lora_int_id=lora_int_id,
+                lora_path=f"{str(local_lora_dir)}/",  # vLLM expects directory path
+            )
+
+            return lora_request
+
+        except Exception as e:
+            logger.error(f"Failed to process LoRA adapters: {e}")
+            raise RuntimeError(f"Failed to process LoRA adapters: {e}") from e
 
     def _get_tool_parser(
         self, tool_parser_name: str | None = None, enable_auto_tools: bool = False

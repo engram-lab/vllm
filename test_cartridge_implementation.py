@@ -36,16 +36,15 @@ def test_cartridge_creation_and_loading():
         torch.save(cartridge_data, cartridge_path)
         print(f"  Token IDs: {test_token_ids}")
 
-        # Test loading with CartridgeManager
-        from vllm.utils.cartridge_manager import CartridgeManager
+        # Test loading with AdapterManager
+        from vllm.utils.adapter_manager import AdapterManager
 
-        manager = CartridgeManager(cache_dir=str(Path(tmpdir) / "cache"))
-        print(f"\n✓ Created CartridgeManager with cache_dir: {manager.cache_dir}")
+        manager = AdapterManager(cache_dir=str(Path(tmpdir) / "cache"))
+        print(f"\n✓ Created AdapterManager with cache_dir: {manager.cache_dir}")
 
-        # Load the cartridge
-        loaded_data = manager.get_cartridge(
-            cartridge_id=str(cartridge_path),
-            source="local",
+        # Load the adapter (cartridge)
+        loaded_data = manager.get_adapter(
+            adapter_id=str(cartridge_path),
             force_redownload=False
         )
 
@@ -86,7 +85,6 @@ def test_cartridge_loader():
         # Load using cartridge_loader
         loaded_cartridge = load_cartridge(
             cartridge_id=str(cartridge_path),
-            source="local",
             force_redownload=False
         )
 
@@ -156,7 +154,7 @@ def test_caching_behavior():
     print("Test 4: Caching Behavior")
     print("=" * 60)
 
-    from vllm.utils.cartridge_manager import CartridgeManager
+    from vllm.utils.adapter_manager import AdapterManager
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cache_dir = Path(tmpdir) / "cache"
@@ -165,15 +163,15 @@ def test_caching_behavior():
         # Create cartridge
         torch.save({'token_ids': [1, 2, 3]}, cartridge_path)
 
-        manager = CartridgeManager(cache_dir=str(cache_dir))
+        manager = AdapterManager(cache_dir=str(cache_dir))
 
         # First load - should copy to cache for local files
         print(f"\n✓ First load (should read from source)")
-        data1 = manager.get_cartridge(str(cartridge_path), source="local")
+        data1 = manager.get_adapter(str(cartridge_path))
 
         # Second load - should use same file for local
         print(f"✓ Second load (local files are not cached, read directly)")
-        data2 = manager.get_cartridge(str(cartridge_path), source="local")
+        data2 = manager.get_adapter(str(cartridge_path))
 
         # Both should have same content
         assert data1['token_ids'].tolist() == data2['token_ids'].tolist()
@@ -198,12 +196,10 @@ def test_protocol_models():
     print("\n✓ Testing KVCacheCartridge model")
     cartridge = KVCacheCartridge(
         id="s3://bucket/path.pt",
-        source="s3",
         force_redownload=True
     )
     print(f"  Cartridge: {cartridge}")
     assert cartridge.id == "s3://bucket/path.pt"
-    assert cartridge.source == "s3"
     assert cartridge.force_redownload == True
 
     # Test ChatCompletionRequest with cartridges
@@ -214,7 +210,6 @@ def test_protocol_models():
         cartridges=[
             KVCacheCartridge(
                 id="s3://bucket/test.pt",
-                source="s3",
                 force_redownload=False
             )
         ]
@@ -228,7 +223,7 @@ def test_protocol_models():
         prompt="Test prompt",
         model="test-model",
         cartridges=[
-            KVCacheCartridge(id="local/path.pt", source="local")
+            KVCacheCartridge(id="local/path.pt")
         ]
     )
     assert len(comp_request.cartridges) == 1
