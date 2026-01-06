@@ -11,14 +11,16 @@ This class is storage-agnostic and doesn't handle adapter-specific logic.
 """
 
 import hashlib
+import json
 import logging
 import os
-from pathlib import Path
+from pathlib import Path as StdPath
 from typing import Optional
-from urllib.parse import urlparse
 
 import filelock
 import torch
+
+from vllm.path import Path
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +54,11 @@ class AdapterManager:
                 os.path.expanduser("~"), ".cache", "vllm", "adapters"
             )
 
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = StdPath(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"AdapterManager initialized with cache_dir: {self.cache_dir}")
 
-    def _get_cache_path(self, uri: str) -> Path:
+    def _get_cache_path(self, uri: str) -> StdPath:
         """
         Get the local cache path for a given URI.
 
@@ -70,107 +72,35 @@ class AdapterManager:
         uri_hash = hashlib.sha256(uri.encode()).hexdigest()
         return self.cache_dir / f"{uri_hash}.pt"
 
-    def _download_from_s3(self, s3_uri: str, local_path: Path) -> None:
-        """
-        Download a file from S3 to a local path.
-
-        Args:
-            s3_uri: S3 URI (e.g., s3://bucket/path/to/file.pt)
-            local_path: Local path to save the downloaded file
-
-        Raises:
-            ImportError: If boto3 is not installed
-            Exception: If download fails
-        """
-        try:
-            import boto3
-            from botocore.exceptions import BotoCoreError, ClientError
-        except ImportError as e:
-            raise ImportError(
-                "boto3 is required to download adapters from S3. "
-                "Please install it with: pip install boto3"
-            ) from e
-
-        # Parse S3 URI
-        parsed = urlparse(s3_uri)
-        
-        if parsed.scheme != "s3":
-            raise ValueError(f"Invalid S3 URI: {s3_uri}. Expected s3:// scheme.")
-
-        bucket = parsed.netloc
-        key = parsed.path.lstrip("/")
-
-        if not bucket or not key:
-            raise ValueError(
-                f"Invalid S3 URI: {s3_uri}. Expected format: s3://bucket/path/to/file"
-            )
-
-        logger.info(f"Downloading adapter from s3://{bucket}/{key}")
-
-        try:
-            s3_client = boto3.client("s3")
-
-            # Download to a temporary file first, then move to final location
-            temp_path = local_path.with_suffix(".tmp")
-            s3_client.download_file(bucket, key, str(temp_path))
-            temp_path.rename(local_path)
-            
-            final_size_mb = local_path.stat().st_size / (1024 * 1024)
-            logger.info(f"Successfully downloaded adapter to {local_path} ({final_size_mb:.2f} MB)")
-            
-        except (BotoCoreError, ClientError) as e:
-            # Clean up partial download
-            if temp_path.exists():
-                temp_path.unlink()
-            
-            raise RuntimeError(f"Failed to download adapter from {s3_uri}: {e}") from e
-        except Exception as e:
-            # Clean up partial download
-            if temp_path.exists():
-                temp_path.unlink()
-            
-            raise
-
     def get_adapter(
         self,
         adapter_id: str,
-        source: str = "s3",
         force_redownload: bool = False,
     ) -> torch.Tensor:
         """
         Get an adapter, downloading from S3 or loading from local path.
 
+        The adapter_id can be either:
+        - S3 URI: s3://bucket/path/to/adapter.pt
+        - Local path: /path/to/local/adapter.pt or ./adapter.pt
+
+        The Path abstraction automatically handles both cases.
+
         Args:
-            adapter_id: The identifier/path of the adapter.
-                       For S3: s3://bucket/path/to/adapter.pt
-                       For local: /path/to/local/adapter.pt
-            source: Source type ('s3' or 'local')
-            force_redownload: If True, re-download even if cached
+            adapter_id: The identifier/path of the adapter (S3 URI or local path)
+            force_redownload: If True, re-download even if cached (only applies to remote files)
 
         Returns:
             Loaded adapter tensor data
 
         Raises:
-            FileNotFoundError: If local file doesn't exist
+            FileNotFoundError: If file doesn't exist
             RuntimeError: If download or loading fails
         """
-        if source == "local":
-            # Load directly from local path
-            local_path = Path(adapter_id)
-            
-            if not local_path.exists():
-                raise FileNotFoundError(f"Local adapter not found: {adapter_id}")
-
-            logger.info(f"Loading adapter from local path: {adapter_id}")
-            try:
-                data = torch.load(local_path, map_location="cpu")
-                return data
-            except Exception as e:
-                logger.error(f"Failed to load local adapter: {e}")
-                raise
-
-        elif source == "s3":
-            # Get cache path
+        source_path = Path(adapter_id)
+        
+        # For remote paths (S3), use caching
+        if adapter_id.startswith("s3://"):
             cache_path = self._get_cache_path(adapter_id)
             lock_path = cache_path.with_suffix(".lock")
 
@@ -180,7 +110,17 @@ class AdapterManager:
                 should_download = force_redownload or not cache_path.exists()
 
                 if should_download:
-                    self._download_from_s3(adapter_id, cache_path)
+                    logger.info(f"Downloading adapter from {adapter_id}")
+                    try:
+                        # Use Path's copy method to download from S3 to local cache
+                        source_path.copy(str(cache_path))
+                        final_size_mb = cache_path.stat().st_size / (1024 * 1024)
+                        logger.info(f"Successfully downloaded adapter to {cache_path} ({final_size_mb:.2f} MB)")
+                    except Exception as e:
+                        # Clean up partial download
+                        if cache_path.exists():
+                            cache_path.unlink()
+                        raise RuntimeError(f"Failed to download adapter from {adapter_id}: {e}") from e
                 else:
                     logger.info(f"Using cached adapter: {cache_path}")
 
@@ -188,34 +128,48 @@ class AdapterManager:
                 try:
                     data = torch.load(cache_path, map_location="cpu")
                     return data
-                    
                 except Exception as e:
                     # If loading failed, try re-downloading once
                     if not should_download:
                         logger.info("Retrying with fresh download...")
-                        self._download_from_s3(adapter_id, cache_path)
-                        data = torch.load(cache_path, map_location="cpu")
-                        return data
-                    
+                        try:
+                            source_path.copy(str(cache_path))
+                            data = torch.load(cache_path, map_location="cpu")
+                            return data
+                        except Exception as retry_e:
+                            raise RuntimeError(f"Failed to load adapter even after retry: {retry_e}") from retry_e
                     raise RuntimeError(f"Failed to load adapter: {e}") from e
-
+        
+        # For local paths, load directly
         else:
-            raise ValueError(f"Unknown source type: {source}. Expected 's3' or 'local'.")
+            if not source_path.exists():
+                raise FileNotFoundError(f"Local adapter not found: {adapter_id}")
+
+            logger.info(f"Loading adapter from local path: {adapter_id}")
+            try:
+                # For local paths, we can use the path directly as it's file-like
+                data = torch.load(str(source_path), map_location="cpu")
+                return data
+            except Exception as e:
+                logger.error(f"Failed to load local adapter: {e}")
+                raise
 
     def download_json(
         self,
         json_id: str,
-        source: str = "s3",
-        target_path: Optional[Path] = None,
+        target_path: Optional[StdPath] = None,
     ) -> dict:
         """
         Download and parse a JSON file from S3 or local path.
 
+        The json_id can be either:
+        - S3 URI: s3://bucket/path/to/file.json
+        - Local path: /path/to/local/file.json
+
+        The Path abstraction automatically handles both cases.
+
         Args:
-            json_id: The identifier/path of the JSON file.
-                    For S3: s3://bucket/path/to/file.json
-                    For local: /path/to/local/file.json
-            source: Source type ('s3' or 'local')
+            json_id: The identifier/path of the JSON file (S3 URI or local path)
             target_path: Optional local path to save the downloaded JSON.
                         If not provided, returns parsed dict without saving.
 
@@ -223,67 +177,28 @@ class AdapterManager:
             Parsed JSON content as a dictionary
 
         Raises:
-            FileNotFoundError: If local file doesn't exist
+            FileNotFoundError: If file doesn't exist
             RuntimeError: If download or parsing fails
         """
-        import json
+        source_path = Path(json_id)
+        
+        if not source_path.exists():
+            raise FileNotFoundError(f"JSON file not found: {json_id}")
 
-        if source == "local":
-            # Load directly from local path
-            local_path = Path(json_id)
-            
-            if not local_path.exists():
-                raise FileNotFoundError(f"Local JSON file not found: {json_id}")
-
-            with open(local_path, 'r') as f:
-                data = json.load(f)
-            
-            # Optionally copy to target path
-            if target_path is not None and target_path != local_path:
-                import shutil
-                shutil.copy(local_path, target_path)
-            
-            return data
-
-        elif source == "s3":
-            # Download from S3
-            try:
-                import boto3
-                from botocore.exceptions import BotoCoreError, ClientError
-            except ImportError as e:
-                raise ImportError(
-                    "boto3 is required to download from S3. "
-                    "Please install it with: pip install boto3"
-                ) from e
-
-            # Parse S3 URI
-            if json_id.startswith("s3://"):
-                s3_path = json_id[5:]  # Remove s3:// prefix
-                bucket, key = s3_path.split("/", 1)
-            else:
-                raise ValueError(f"Invalid S3 URI: {json_id}. Expected s3:// prefix.")
-
-            logger.info(f"Downloading JSON from s3://{bucket}/{key}")
-
-            try:
-                s3_client = boto3.client("s3")
-                response = s3_client.get_object(Bucket=bucket, Key=key)
-                body_content = response["Body"].read()
-                data = json.loads(body_content)
-                
-                # Save to target path if provided
-                if target_path is not None:
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(target_path, 'w') as f:
-                        json.dump(data, f, indent=2)
-                
-                return data
-
-            except (BotoCoreError, ClientError) as e:
-                raise RuntimeError(f"Failed to download JSON from {json_id}: {e}") from e
-
-        else:
-            raise ValueError(f"Unknown source type: {source}. Expected 's3' or 'local'.")
+        # Read and parse JSON using the unified Path API
+        try:
+            content = source_path.read_text()
+            data = json.loads(content)
+        except Exception as e:
+            raise RuntimeError(f"Failed to read or parse JSON from {json_id}: {e}") from e
+        
+        # Save to target path if provided
+        if target_path is not None:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(target_path, 'w') as f:
+                json.dump(data, f, indent=2)
+        
+        return data
 
     def clear_cache(self) -> None:
         """Clear all cached adapters."""
