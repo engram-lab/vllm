@@ -473,10 +473,13 @@ class OpenAIServing:
             import hashlib
             from pathlib import Path
             import os
+            import vllm.envs as envs
 
             # Create a unique local path for this LoRA adapter
+            # Use persistent cache directory if configured, otherwise fall back to /tmp
             lora_hash = hashlib.sha256(lora_id.encode()).hexdigest()[:16]
-            local_lora_dir = Path(tempfile.gettempdir()) / "vllm_loras" / lora_hash
+            lora_cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR or tempfile.gettempdir()
+            local_lora_dir = Path(lora_cache_dir) / lora_hash
             local_lora_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"LoRA adapter storage directory: {local_lora_dir}")
             
