@@ -814,16 +814,29 @@ class GPUModelRunner(
                 stacked_keys, stacked_values = new_req_data.cartridge_kv
                 cartridge_id = new_req_data.cartridge_id
                 
-                # Validate cartridge shape: (num_layers, num_kv_heads, seq_len, head_dim)
-                expected_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
+                # Validate and shard cartridge for tensor parallelism
+                # Cartridge has TOTAL KV heads, but each GPU needs only its assigned heads
+                total_kv_heads = self.model_config.get_total_num_kv_heads()
                 expected_head_size = self.model_config.get_head_size()
                 _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
-                assert cart_kv_heads == expected_kv_heads, (
-                    f"Cartridge num_kv_heads={cart_kv_heads} doesn't match model's {expected_kv_heads}"
+                assert cart_kv_heads == total_kv_heads, (
+                    f"Cartridge num_kv_heads={cart_kv_heads} doesn't match model's {total_kv_heads}"
                 )
                 assert cart_head_dim == expected_head_size, (
                     f"Cartridge head_dim={cart_head_dim} doesn't match model's {expected_head_size}"
                 )
+                
+                # Shard cartridge KV for tensor parallelism (matching how model shards KV heads)
+                tp_size = self.parallel_config.tensor_parallel_size
+                if tp_size > 1 and total_kv_heads >= tp_size:
+                    tp_rank = get_tp_group().rank_in_group
+                    heads_per_gpu = total_kv_heads // tp_size
+                    start_head = tp_rank * heads_per_gpu
+                    end_head = start_head + heads_per_gpu
+                    # Slice: (num_layers, total_kv_heads, seq_len, head_dim) -> (num_layers, heads_per_gpu, seq_len, head_dim)
+                    stacked_keys = stacked_keys[:, start_head:end_head, :, :].contiguous()
+                    stacked_values = stacked_values[:, start_head:end_head, :, :].contiguous()
+                    logger.debug(f"Sharded cartridge KV for TP rank {tp_rank}: heads [{start_head}:{end_head}]")
                 
                 self.cartridge_kv_refs[req_id] = (stacked_keys, stacked_values, cartridge_id)
                 # Store position offset for RoPE - input tokens should have RoPE positions

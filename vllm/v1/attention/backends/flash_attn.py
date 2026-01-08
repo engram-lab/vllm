@@ -608,16 +608,8 @@ class FlashAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_seqs = attn_metadata.query_start_loc.shape[0] - 1
         
-        # Handle shape: cartridge may be (seq_len, num_kv_heads, head_size) 
-        # or (num_kv_heads, seq_len, head_size). We need (num_kv_heads, seq_len, head_size).
-        # Detect by checking if shape[0] matches num_kv_heads
-        if cartridge_k.shape[0] != self.num_kv_heads and cartridge_k.shape[1] == self.num_kv_heads:
-            # Shape is (seq_len, num_kv_heads, head_size) - need to transpose
-            cartridge_k = cartridge_k.transpose(0, 1).contiguous()
-            cartridge_v = cartridge_v.transpose(0, 1).contiguous()
-        
-        # Get cartridge sequence length
-        # Input shape is (num_kv_heads, seq_len, head_size)
+        # Cartridge shape: (num_kv_heads_per_gpu, seq_len, head_size) - already sharded for TP
+        # This should match self.num_kv_heads which is the per-GPU KV head count
         cartridge_seq_len = cartridge_k.shape[1]
         
         # Reshape cartridge KV to flash attention format: (seq_len, num_kv_heads, head_size)
