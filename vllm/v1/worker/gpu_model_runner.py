@@ -814,11 +814,18 @@ class GPUModelRunner(
                 stacked_keys, stacked_values = new_req_data.cartridge_kv
                 cartridge_id = new_req_data.cartridge_id
                 
-                # Validate and shard cartridge for tensor parallelism
+                # Validate cartridge dimensions match model architecture
                 # Cartridge has TOTAL KV heads, but each GPU needs only its assigned heads
                 total_kv_heads = self.model_config.get_total_num_kv_heads()
                 expected_head_size = self.model_config.get_head_size()
-                _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
+                expected_num_layers = self.model_config.get_num_layers(self.parallel_config)
+                cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
+                if cart_num_layers != expected_num_layers:
+                    raise ValueError(
+                        f"Cartridge incompatible with model: num_layers={cart_num_layers} "
+                        f"but model expects {expected_num_layers}. "
+                        f"Cartridge may have been trained on a different model."
+                    )
                 if cart_kv_heads != total_kv_heads:
                     raise ValueError(
                         f"Cartridge incompatible with model: num_kv_heads={cart_kv_heads} "

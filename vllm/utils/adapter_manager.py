@@ -14,6 +14,8 @@ import hashlib
 import json
 import logging
 import os
+import threading
+import time
 from pathlib import Path as StdPath
 from typing import Optional
 
@@ -104,20 +106,102 @@ class AdapterManager:
             cache_path = self._get_cache_path(adapter_id)
             lock_path = cache_path.with_suffix(".lock")
 
+            def _copy_with_progress(*, reason: str) -> None:
+                """Copy adapter from source_path to cache_path with progress logging.
+
+                NOTE: Path.copy doesn't expose callbacks, so we poll the destination size.
+                boto3's download_file writes to a temp file (*.XXXXXX) then renames atomically.
+                """
+                import glob as globlib
+                start_t = time.time()
+                stop_evt = threading.Event()
+
+                def _get_download_size() -> int:
+                    """Get size of download in progress (checks both final and temp files)."""
+                    # Check final destination first
+                    if cache_path.exists():
+                        return cache_path.stat().st_size
+                    # Check for boto3 temp files (pattern: cache_path.XXXXXX)
+                    temp_pattern = str(cache_path) + ".*"
+                    temp_files = globlib.glob(temp_pattern)
+                    if temp_files:
+                        # Return size of largest temp file (in case of stale ones)
+                        return max(StdPath(f).stat().st_size for f in temp_files)
+                    return 0
+
+                def _log_progress() -> None:
+                    last_size = -1
+                    last_change_t = time.time()
+                    while not stop_evt.wait(10.0):
+                        try:
+                            size = _get_download_size()
+                            now = time.time()
+                            if size != last_size:
+                                last_change_t = now
+                                delta_mb = (size - last_size) / (1024 * 1024) if last_size >= 0 else 0.0
+                                logger.info(
+                                    "Adapter download progress (%s): %.2f MB (Δ%.2f MB) -> %s",
+                                    reason,
+                                    size / (1024 * 1024),
+                                    delta_mb,
+                                    cache_path,
+                                )
+                                last_size = size
+                            elif now - last_change_t > 120:
+                                # If nothing changes for a while, still emit a heartbeat so it
+                                # doesn't look like a hang.
+                                logger.info(
+                                    "Adapter download still in progress (%s): %.2f MB written to %s (no size change for %.0fs)",
+                                    reason,
+                                    size / (1024 * 1024),
+                                    cache_path,
+                                    now - last_change_t,
+                                )
+                                last_change_t = now
+                        except Exception:
+                            # Never let progress logging impact the download path.
+                            pass
+
+                t = threading.Thread(target=_log_progress, daemon=True)
+                t.start()
+                try:
+                    source_path.copy(str(cache_path))
+                finally:
+                    stop_evt.set()
+                final_size_mb = cache_path.stat().st_size / (1024 * 1024)
+                logger.info(
+                    "Finished adapter download (%s): %s (%.2f MB) in %.1fs",
+                    reason,
+                    cache_path,
+                    final_size_mb,
+                    time.time() - start_t,
+                )
+
+            def _cleanup_temp_files() -> None:
+                """Remove stale boto3 temp files from previous interrupted downloads."""
+                import glob as globlib
+                temp_pattern = str(cache_path) + ".*"
+                for temp_file in globlib.glob(temp_pattern):
+                    try:
+                        StdPath(temp_file).unlink()
+                        logger.info(f"Cleaned up stale temp file: {temp_file}")
+                    except Exception:
+                        pass
+
             # Use file lock to prevent concurrent downloads
             with filelock.FileLock(lock_path, timeout=300):
                 # Check if we need to download
                 should_download = force_redownload or not cache_path.exists()
 
                 if should_download:
+                    # Clean up any stale temp files from previous interrupted downloads
+                    _cleanup_temp_files()
                     logger.info(f"Downloading adapter from {adapter_id}")
                     try:
-                        # Use Path's copy method to download from S3 to local cache
-                        source_path.copy(str(cache_path))
-                        final_size_mb = cache_path.stat().st_size / (1024 * 1024)
-                        logger.info(f"Successfully downloaded adapter to {cache_path} ({final_size_mb:.2f} MB)")
+                        _copy_with_progress(reason="initial")
                     except Exception as e:
-                        # Clean up partial download
+                        # Clean up partial download and temp files
+                        _cleanup_temp_files()
                         if cache_path.exists():
                             cache_path.unlink()
                         raise RuntimeError(f"Failed to download adapter from {adapter_id}: {e}") from e
@@ -133,10 +217,15 @@ class AdapterManager:
                     if not should_download:
                         logger.info("Retrying with fresh download...")
                         try:
-                            source_path.copy(str(cache_path))
+                            # Clean up corrupted cache and any stale temp files
+                            _cleanup_temp_files()
+                            if cache_path.exists():
+                                cache_path.unlink()
+                            _copy_with_progress(reason="retry_after_load_failure")
                             data = torch.load(cache_path, map_location="cpu")
                             return data
                         except Exception as retry_e:
+                            _cleanup_temp_files()
                             raise RuntimeError(f"Failed to load adapter even after retry: {retry_e}") from retry_e
                     raise RuntimeError(f"Failed to load adapter: {e}") from e
         

@@ -1083,6 +1083,19 @@ def _copy_across_filesystems(source, dest, recursive):
     assert isinstance(dest, Path), type(dest)
     if not recursive:
         assert source.isfile()
+        # Fast path: S3 -> local using boto3 transfer manager (multi-part parallel download)
+        if isinstance(source, S3Path) and isinstance(dest, LocalPath):
+            from boto3.s3.transfer import TransferConfig
+            config = TransferConfig(
+                multipart_threshold=8 * 1024 * 1024,
+                max_concurrency=10,
+                multipart_chunksize=8 * 1024 * 1024,
+                use_threads=True,
+            )
+            source.client.download_file(
+                source.bucket_name, source.key, str(dest), Config=config
+            )
+            return
         # Stream the file to avoid loading large files into memory
         with source.open("rb") as src:
             with dest.open("wb") as dst:
