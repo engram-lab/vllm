@@ -58,7 +58,11 @@ def _parse_kv_cache_to_layers(
         kv_type = match.group(2)
         
         # Transform: (1, seq_len, num_kv_heads, head_dim) -> (num_kv_heads, seq_len, head_dim)
-        assert tensor.dim() == 4, f"Expected 4D tensor for {key_name}, got {tensor.shape}"
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"Invalid cartridge format: {key_name} should be 4D "
+                f"(1, seq_len, num_kv_heads, head_dim), got {tensor.shape}"
+            )
         tensor = tensor.squeeze(0).permute(1, 0, 2)
         
         if device is not None:
@@ -164,7 +168,10 @@ class CartridgeData:
         if not self.kv_cache:
             return 0
         tensor = next(iter(self.kv_cache.values()))
-        assert tensor.dim() == 4, f"Expected 4D tensor, got {tensor.dim()}D: {tensor.shape}"
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"Invalid cartridge format: expected 4D tensor, got {tensor.dim()}D: {tensor.shape}"
+            )
         return tensor.shape[1]
     
     def has_valid_token_ids(self) -> bool:
@@ -291,18 +298,24 @@ class CartridgeData:
         first_key = next(iter(kv_cache))
         first_tensor = kv_cache[first_key]
         
-        assert first_tensor.dim() == 4, (
-            f"Expected 4D tensor (1, seq_len, num_kv_heads, head_dim), "
-            f"got {first_tensor.dim()}D: {first_tensor.shape}"
-        )
-        assert first_tensor.shape[0] == 1, (
-            f"Expected batch dim = 1, got {first_tensor.shape[0]}"
-        )
+        if first_tensor.dim() != 4:
+            raise ValueError(
+                f"Invalid cartridge format: expected 4D tensor "
+                f"(1, seq_len, num_kv_heads, head_dim), "
+                f"got {first_tensor.dim()}D: {first_tensor.shape}"
+            )
+        if first_tensor.shape[0] != 1:
+            raise ValueError(
+                f"Invalid cartridge format: expected batch dim = 1, "
+                f"got {first_tensor.shape[0]}"
+            )
         
         expected_shape = first_tensor.shape
         for key, tensor in kv_cache.items():
-            assert tensor.shape == expected_shape, (
-                f"Shape mismatch: {key} has {tensor.shape}, expected {expected_shape}"
+            if tensor.shape != expected_shape:
+                raise ValueError(
+                    f"Cartridge shape mismatch: {key} has {tensor.shape}, "
+                    f"expected {expected_shape}"
             )
         
         seq_len, num_kv_heads, head_dim = expected_shape[1], expected_shape[2], expected_shape[3]

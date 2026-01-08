@@ -819,12 +819,18 @@ class GPUModelRunner(
                 total_kv_heads = self.model_config.get_total_num_kv_heads()
                 expected_head_size = self.model_config.get_head_size()
                 _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
-                assert cart_kv_heads == total_kv_heads, (
-                    f"Cartridge num_kv_heads={cart_kv_heads} doesn't match model's {total_kv_heads}"
-                )
-                assert cart_head_dim == expected_head_size, (
-                    f"Cartridge head_dim={cart_head_dim} doesn't match model's {expected_head_size}"
-                )
+                if cart_kv_heads != total_kv_heads:
+                    raise ValueError(
+                        f"Cartridge incompatible with model: num_kv_heads={cart_kv_heads} "
+                        f"but model expects {total_kv_heads}. "
+                        f"Cartridge may have been trained on a different model."
+                    )
+                if cart_head_dim != expected_head_size:
+                    raise ValueError(
+                        f"Cartridge incompatible with model: head_dim={cart_head_dim} "
+                        f"but model expects {expected_head_size}. "
+                        f"Cartridge may have been trained on a different model."
+                    )
                 
                 # Shard cartridge KV for tensor parallelism (matching how model shards KV heads)
                 tp_size = self.parallel_config.tensor_parallel_size

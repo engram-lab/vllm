@@ -408,6 +408,25 @@ class OpenAIServing:
                 # Get stacked KV tensors (computed once, then cached)
                 stacked_cartridge_kv = cartridge_data.get_stacked_kv()
                 
+                # Validate cartridge is compatible with this model (before sending to workers)
+                if stacked_cartridge_kv is not None:
+                    stacked_keys = stacked_cartridge_kv[0]
+                    _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
+                    expected_kv_heads = self.model_config.get_total_num_kv_heads()
+                    expected_head_size = self.model_config.get_head_size()
+                    if cart_kv_heads != expected_kv_heads:
+                        raise ValueError(
+                            f"Cartridge incompatible with model {self.model_config.model}: "
+                            f"cartridge has {cart_kv_heads} KV heads but model expects {expected_kv_heads}. "
+                            f"The cartridge may have been trained on a different model."
+                        )
+                    if cart_head_dim != expected_head_size:
+                        raise ValueError(
+                            f"Cartridge incompatible with model {self.model_config.model}: "
+                            f"cartridge has head_dim={cart_head_dim} but model expects {expected_head_size}. "
+                            f"The cartridge may have been trained on a different model."
+                        )
+                
             # Handle pre-computed cartridges (token prepending for prefix caching)
             cartridge_token_ids = []
             for cartridge_data in precomputed_cartridges:
