@@ -813,13 +813,24 @@ class GPUModelRunner(
             if new_req_data.cartridge_kv is not None and new_req_data.cartridge_id is not None:
                 stacked_keys, stacked_values = new_req_data.cartridge_kv
                 cartridge_id = new_req_data.cartridge_id
+                
+                # Validate cartridge shape: (num_layers, num_kv_heads, seq_len, head_dim)
+                expected_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
+                expected_head_size = self.model_config.get_head_size()
+                _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
+                assert cart_kv_heads == expected_kv_heads, (
+                    f"Cartridge num_kv_heads={cart_kv_heads} doesn't match model's {expected_kv_heads}"
+                )
+                assert cart_head_dim == expected_head_size, (
+                    f"Cartridge head_dim={cart_head_dim} doesn't match model's {expected_head_size}"
+                )
+                
                 self.cartridge_kv_refs[req_id] = (stacked_keys, stacked_values, cartridge_id)
-                cartridge_seq_len = stacked_keys.shape[2]
                 # Store position offset for RoPE - input tokens should have RoPE positions
                 # starting AFTER the cartridge (at position cartridge_seq_len)
-                self.cartridge_position_offsets[req_id] = cartridge_seq_len
+                self.cartridge_position_offsets[req_id] = cart_seq_len
                 logger.debug(f"Stored cartridge KV for request {req_id}: "
-                            f"{stacked_keys.shape[0]} layers, seq_len={cartridge_seq_len}")
+                            f"{stacked_keys.shape[0]} layers, seq_len={cart_seq_len}")
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
