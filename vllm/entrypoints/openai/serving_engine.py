@@ -499,7 +499,9 @@ class OpenAIServing:
                 torch.save(lora_data, adapter_model_path)
                 
                 # Download lora_config.json from S3, save as adapter_config.json locally (vLLM format)
-                adapter_config_id = os.path.join(lora_id, "lora_config.json")
+                # If lora_id ends with .pt, use its directory; otherwise use lora_id as-is
+                lora_dir = os.path.dirname(lora_id) if lora_id.endswith(".pt") else lora_id
+                adapter_config_id = os.path.join(lora_dir, "lora_config.json")
                 
                 try:
                     manager.download_json(
