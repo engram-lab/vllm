@@ -55,6 +55,7 @@ from vllm.entrypoints.openai.protocol import (
     EmbeddingCompletionRequest,
     EmbeddingRequest,
     EmbeddingResponse,
+    ErrorDebugInfo,
     ErrorInfo,
     ErrorResponse,
     FunctionCall,
@@ -1019,6 +1020,8 @@ class OpenAIServing:
         message: str,
         err_type: str = "BadRequestError",
         status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+        request_id: str | None = None,
+        request: AnyRequest | None = None,
     ) -> ErrorResponse:
         if self.log_error_stack:
             exc_type, _, _ = sys.exc_info()
@@ -1026,8 +1029,54 @@ class OpenAIServing:
                 traceback.print_exc()
             else:
                 traceback.print_stack()
+
+        debug_info = None
+        if envs.VLLM_PASSTHROUGH_ERRORS:
+            # Include debug info for internal servers
+            stack_trace = None
+            exc_type, _, tb = sys.exc_info()
+            if exc_type is not None:
+                stack_trace = "".join(traceback.format_exception(exc_type, value=None, tb=tb))
+
+            # Extract request metadata (not full prompts for security)
+            num_prompt_tokens = None
+            num_messages = None
+            model = None
+            adapter_ids = None
+            temperature = None
+            max_tokens = None
+
+            if request is not None:
+                model = getattr(request, "model", None)
+                temperature = getattr(request, "temperature", None)
+                max_tokens = getattr(request, "max_tokens", None)
+                # Get adapter IDs if available
+                adapters = getattr(request, "adapters", None)
+                if adapters:
+                    adapter_ids = [getattr(a, "id", str(a)) for a in adapters]
+                # Count messages for chat requests
+                messages = getattr(request, "messages", None)
+                if messages:
+                    num_messages = len(messages)
+
+            debug_info = ErrorDebugInfo(
+                request_id=request_id,
+                stack_trace=stack_trace,
+                num_prompt_tokens=num_prompt_tokens,
+                num_messages=num_messages,
+                model=model,
+                adapter_ids=adapter_ids,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
         return ErrorResponse(
-            error=ErrorInfo(message=message, type=err_type, code=status_code.value)
+            error=ErrorInfo(
+                message=message,
+                type=err_type,
+                code=status_code.value,
+                debug=debug_info,
+            )
         )
 
     def create_streaming_error_response(
@@ -1035,10 +1084,16 @@ class OpenAIServing:
         message: str,
         err_type: str = "BadRequestError",
         status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+        request_id: str | None = None,
+        request: AnyRequest | None = None,
     ) -> str:
         json_str = json.dumps(
             self.create_error_response(
-                message=message, err_type=err_type, status_code=status_code
+                message=message,
+                err_type=err_type,
+                status_code=status_code,
+                request_id=request_id,
+                request=request,
             ).model_dump()
         )
         return json_str

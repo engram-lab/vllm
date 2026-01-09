@@ -129,11 +129,26 @@ class OpenAIBaseModel(BaseModel):
         return result
 
 
+class ErrorDebugInfo(OpenAIBaseModel):
+    """Debug info included when VLLM_PASSTHROUGH_ERRORS is enabled."""
+    request_id: str | None = None
+    stack_trace: str | None = None
+    # Request metadata (not full prompts/completions for security)
+    num_prompt_tokens: int | None = None
+    num_messages: int | None = None
+    model: str | None = None
+    adapter_ids: list[str] | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+
 class ErrorInfo(OpenAIBaseModel):
     message: str
     type: str
     param: str | None = None
     code: int
+    # Debug info only included when VLLM_PASSTHROUGH_ERRORS is enabled
+    debug: ErrorDebugInfo | None = None
 
 
 class ErrorResponse(OpenAIBaseModel):

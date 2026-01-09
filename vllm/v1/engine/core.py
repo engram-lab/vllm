@@ -842,7 +842,7 @@ class EngineCoreProc(EngineCore):
                 logger.exception("EngineCore failed to start.")
             else:
                 logger.exception("EngineCore encountered a fatal error.")
-                engine_core._send_engine_dead()
+                engine_core._send_engine_dead(exception=e)
             raise e
         finally:
             if engine_core is not None:
@@ -946,11 +946,23 @@ class EngineCoreProc(EngineCore):
             for v, p in zip(args, arg_types)
         )
 
-    def _send_engine_dead(self):
-        """Send EngineDead status to the EngineCoreClient."""
-
+    def _send_engine_dead(self, exception: Exception | None = None):
+        """Send EngineDead status to the EngineCoreClient.
+        
+        Args:
+            exception: The exception that caused the engine to die. If provided,
+                      the error message will be propagated to the client.
+        """
+        # Include the exception message if available for better debugging
+        if exception is not None:
+            # Format: ENGINE_CORE_DEAD:<error_message>
+            error_msg = f"{type(exception).__name__}: {exception}"
+            dead_signal = EngineCoreProc.ENGINE_CORE_DEAD + b":" + error_msg.encode("utf-8", errors="replace")
+        else:
+            dead_signal = EngineCoreProc.ENGINE_CORE_DEAD
+        
         # Put ENGINE_CORE_DEAD in the queue.
-        self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)
+        self.output_queue.put_nowait(dead_signal)
 
         # Wait until msg sent by the daemon before shutdown.
         self.output_thread.join(timeout=5.0)
@@ -1068,7 +1080,8 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
-                if output == EngineCoreProc.ENGINE_CORE_DEAD:
+                # Check for ENGINE_CORE_DEAD (may include error message after ":")
+                if isinstance(output, bytes) and output.startswith(EngineCoreProc.ENGINE_CORE_DEAD):
                     for socket in sockets:
                         socket.send(output)
                     break
