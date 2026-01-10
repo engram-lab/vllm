@@ -1035,6 +1035,26 @@ class GPUModelRunner(
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
 
+    def _get_cartridge_id_for_batch(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> str | None:
+        """Get the cartridge_id for the current batch if any requests have cartridges.
+
+        This is used to differentiate CUDA graphs - batches with different cartridges
+        need separate graphs since cartridge KV tensors have different memory addresses.
+
+        Returns:
+            The cartridge_id of the first request with a cartridge, or None if no
+            requests have cartridges. If multiple cartridges exist, only the first
+            is returned (matching _get_cartridge_kv_for_batch behavior).
+        """
+        scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+        for req_id in scheduled_req_ids:
+            cartridge_ref = self.cartridge_kv_refs.get(req_id)
+            if cartridge_ref is not None:
+                return cartridge_ref[2]  # (keys, values, cartridge_id)
+        return None
+
     def _get_cartridge_kv_for_batch(
         self, scheduler_output: "SchedulerOutput"
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor]] | None:
@@ -3044,6 +3064,7 @@ class GPUModelRunner(
                 num_tokens=num_input_tokens,
                 uniform_decode=uniform_decode,
                 has_lora=len(self.input_batch.lora_id_to_lora_request) > 0,
+                cartridge_id=self._get_cartridge_id_for_batch(scheduler_output),
             )
             cudagraph_runtime_mode, batch_descriptor = (
                 self.cudagraph_dispatcher.dispatch(
@@ -4041,6 +4062,7 @@ class GPUModelRunner(
                     num_tokens=num_tokens_after_padding,
                     uniform_decode=uniform_decode,
                     has_lora=activate_lora and self.lora_config is not None,
+                    cartridge_id=None,  # Dummy runs don't use cartridges
                 )
             )
             if not is_profile
