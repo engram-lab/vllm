@@ -219,8 +219,13 @@ class OpenAIServingCompletion(OpenAIServing):
                 if "prompt_token_ids" in engine_prompt:
                     # Convert adapters config to dict if present
                     adapters_dict = None
+                    logger.warning(f"[ADAPTER DEBUG] request.adapters = {request.adapters}")
                     if request.adapters:
+                        logger.warning(f"[ADAPTER DEBUG] Adapters found! Converting to dict...")
                         adapters_dict = request.adapters.model_dump()
+                        logger.warning(f"[ADAPTER DEBUG] adapters_dict = {adapters_dict}")
+                    else:
+                        logger.warning(f"[ADAPTER DEBUG] No adapters in request")
                     
                     # Process all adapters (prefix + lora)
                     if adapters_dict:

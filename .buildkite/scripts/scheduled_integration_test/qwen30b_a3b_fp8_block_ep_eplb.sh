@@ -18,7 +18,7 @@ wait_for_server() {
     done'
 }
 
-MODEL="QWen/Qwen3-30B-A3B-FP8"
+MODEL="Qwen/Qwen3-30B-A3B-FP8"
 # Set BACKENDS based on platform
 if command -v rocm-smi &> /dev/null || [[ -d /opt/rocm ]] || [[ -n "${ROCM_PATH:-}" ]]; then
   # ROCm platform
