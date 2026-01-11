@@ -596,17 +596,27 @@ class FlashAttentionImpl(AttentionImpl):
         cartridge_kv: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         """Forward pass with learned cartridge KV prepended.
-        
+
         This runs attention twice:
         1. Attention over the cartridge KV (prefix) - all queries attend to cartridge
         2. Attention over the regular KV cache (suffix)
         Then merges the results using log-sum-exp weights.
-        
+
         The cartridge KV acts like a "soft prompt" that all tokens can attend to.
         """
         cartridge_k, cartridge_v = cartridge_kv
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_seqs = attn_metadata.query_start_loc.shape[0] - 1
+
+        # CUDA events for timing (compatible with CUDA graphs)
+        enable_timing = num_actual_tokens <= 32  # Only time during decode
+        if enable_timing:
+            start_event = torch.cuda.Event(enable_timing=True)
+            prep_event = torch.cuda.Event(enable_timing=True)
+            pass1_event = torch.cuda.Event(enable_timing=True)
+            pass2_event = torch.cuda.Event(enable_timing=True)
+            merge_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
         
         # Cartridge shape: (num_kv_heads_per_gpu, seq_len, head_size) - already sharded for TP
         # This should match self.num_kv_heads which is the per-GPU KV head count
@@ -616,7 +626,7 @@ class FlashAttentionImpl(AttentionImpl):
         # Use .to() with non_blocking for async dtype conversion
         cartridge_k_t = cartridge_k.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
         cartridge_v_t = cartridge_v.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
-        
+
         # For cartridge attention, each sequence attends to the same cartridge KV.
         # Optimize for common single-sequence case to avoid memory allocation.
         if num_seqs == 1:
@@ -637,7 +647,10 @@ class FlashAttentionImpl(AttentionImpl):
             # Using repeat() is more memory-efficient than expand().contiguous().reshape()
             cartridge_k_batch = cartridge_k_t.repeat(num_seqs, 1, 1)
             cartridge_v_batch = cartridge_v_t.repeat(num_seqs, 1, 1)
-        
+
+        if enable_timing:
+            prep_event.record()
+
         # Run attention over cartridge KV (non-causal)
         cartridge_output, cartridge_lse = flash_attn_varlen_func(
             q=query[:num_actual_tokens],
@@ -652,7 +665,10 @@ class FlashAttentionImpl(AttentionImpl):
             return_softmax_lse=True,
             fa_version=self.vllm_flash_attn_version,
         )
-        
+
+        if enable_timing:
+            pass1_event.record()
+
         # Run regular attention with KV cache
         key_cache, value_cache = kv_cache.unbind(0)
         
@@ -700,7 +716,10 @@ class FlashAttentionImpl(AttentionImpl):
             s_aux=self.sinks,
             return_softmax_lse=True,
         )
-        
+
+        if enable_timing:
+            pass2_event.record()
+
         # Merge cartridge and suffix attention outputs using log-sum-exp
         # FA returns LSE in shape [num_heads, num_tokens] which merge_attn_states expects
         merge_attn_states(
@@ -710,7 +729,25 @@ class FlashAttentionImpl(AttentionImpl):
             suffix_output,
             suffix_lse,
         )
-        
+
+        if enable_timing:
+            merge_event.record()
+            torch.cuda.synchronize()  # Only sync at the end for logging
+
+            prep_ms = start_event.elapsed_time(prep_event)
+            pass1_ms = prep_event.elapsed_time(pass1_event)
+            pass2_ms = pass1_event.elapsed_time(pass2_event)
+            merge_ms = pass2_event.elapsed_time(merge_event)
+            total_ms = start_event.elapsed_time(merge_event)
+
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"CARTRIDGE_TIMING [tokens={num_actual_tokens}, cart_len={cartridge_seq_len}]: "
+                f"prep={prep_ms:.2f}ms, pass1={pass1_ms:.2f}ms, pass2={pass2_ms:.2f}ms, "
+                f"merge={merge_ms:.2f}ms, total={total_ms:.2f}ms"
+            )
+
         return output
 
     def forward(
@@ -848,6 +885,13 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
+                # Timing for regular (non-cartridge) path for comparison
+                enable_timing = num_actual_tokens <= 32
+                if enable_timing:
+                    start_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    start_event.record()
+
                 flash_attn_varlen_func(
                     q=query[:num_actual_tokens],
                     k=key_cache,
@@ -871,6 +915,20 @@ class FlashAttentionImpl(AttentionImpl):
                     num_splits=attn_metadata.max_num_splits,
                     s_aux=self.sinks,
                 )
+
+                # Log timing for regular path (only during decode phase)
+                if enable_timing:
+                    end_event.record()
+                    torch.cuda.synchronize()  # Only sync at the end for logging
+
+                    total_ms = start_event.elapsed_time(end_event)
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.info(
+                        f"REGULAR_TIMING [tokens={num_actual_tokens}, kv_len={max_seqlen_k}]: "
+                        f"total={total_ms:.2f}ms"
+                    )
+
                 return output
 
         # Cascade attention (rare case).
