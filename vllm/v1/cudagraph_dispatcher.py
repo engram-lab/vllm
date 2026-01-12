@@ -64,7 +64,8 @@ class CudagraphDispatcher:
         self.cudagraph_keys[runtime_mode].add(batch_descriptor)
 
     def initialize_cudagraph_keys(
-        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int
+        self, cudagraph_mode: CUDAGraphMode, uniform_decode_query_len: int,
+        cartridge_cases: list[int | None] | None = None
     ):
         # This should be called only after attention backend is initialized.
 
@@ -77,17 +78,23 @@ class CudagraphDispatcher:
         else:
             lora_cases = [False]
 
+        # Cartridge cases: None (no cartridge) or specific sequence lengths
+        if cartridge_cases is None:
+            cartridge_cases = [None]
+
         # Note: we create all valid keys for cudagraph here but do not
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
         if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
-            for bs, has_lora in product(
-                self.compilation_config.cudagraph_capture_sizes, lora_cases
+            for bs, has_lora, cartridge_seq_len in product(
+                self.compilation_config.cudagraph_capture_sizes, lora_cases, cartridge_cases
             ):
+                cartridge_id = f"cart_{cartridge_seq_len}" if cartridge_seq_len else None
                 self.add_cudagraph_key(
                     cudagraph_mode.mixed_mode(),
                     BatchDescriptor(
-                        num_tokens=bs, uniform_decode=False, has_lora=has_lora
+                        num_tokens=bs, uniform_decode=False, has_lora=has_lora,
+                        cartridge_id=cartridge_id
                     ),
                 )
 
@@ -106,13 +113,26 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
-            for bs, has_lora in product(cudagraph_capture_sizes_for_decode, lora_cases):
+            for bs, has_lora, cartridge_seq_len in product(
+                cudagraph_capture_sizes_for_decode, lora_cases, cartridge_cases
+            ):
+                cartridge_id = f"cart_{cartridge_seq_len}" if cartridge_seq_len else None
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
                     BatchDescriptor(
-                        num_tokens=bs, uniform_decode=True, has_lora=has_lora
+                        num_tokens=bs, uniform_decode=True, has_lora=has_lora,
+                        cartridge_id=cartridge_id
                     ),
                 )
+
+        # Log the number of keys created
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"Initialized CUDA graph dispatcher with "
+            f"{len(self.cudagraph_keys[CUDAGraphMode.FULL])} FULL keys, "
+            f"{len(self.cudagraph_keys[CUDAGraphMode.PIECEWISE])} PIECEWISE keys"
+        )
         self.keys_initialized = True
 
     def dispatch(
@@ -145,4 +165,13 @@ class CudagraphDispatcher:
             return CUDAGraphMode.PIECEWISE, non_uniform_key
 
         # finally, just return no cudagraphs
+        # Log when no match is found for debugging
+        import logging
+        logger = logging.getLogger(__name__)
+        if batch_descriptor.cartridge_id is not None:
+            logger.debug(
+                f"No CUDA graph match for batch_descriptor: {batch_descriptor}. "
+                f"Available FULL keys: {len(self.cudagraph_keys[CUDAGraphMode.FULL])}, "
+                f"PIECEWISE keys: {len(self.cudagraph_keys[CUDAGraphMode.PIECEWISE])}"
+            )
         return CUDAGraphMode.NONE, None

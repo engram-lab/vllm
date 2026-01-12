@@ -4958,8 +4958,10 @@ class GPUModelRunner(
         # resolved cudagraph mode.
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
+        # Include cartridge cases: None (no cartridge) and 4096 (standard cartridge length)
+        cartridge_cases = [None, 4096]
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
-            cudagraph_mode, self.uniform_decode_query_len
+            cudagraph_mode, self.uniform_decode_query_len, cartridge_cases
         )
 
     def calculate_reorder_batch_threshold(self) -> None:
