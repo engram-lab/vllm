@@ -3099,15 +3099,6 @@ class GPUModelRunner(
                 )
             )
 
-            # Debug logging for cartridge CUDA graph dispatch
-            if batch_desc.cartridge_id is not None:
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.info(
-                    f"CUDAGRAPH_DISPATCH: batch_desc={batch_desc}, "
-                    f"mode={cudagraph_runtime_mode}, matched={batch_descriptor is not None}"
-                )
-
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -4597,6 +4588,28 @@ class GPUModelRunner(
                     gc.unfreeze()
                     gc.collect()
 
+        def _generate_cartridge_cases(self) -> list[int | None]:
+            """Generate cartridge cases for CUDA graph capture.
+
+            Returns a list of cartridge sizes (power-of-2) within the range
+            [min_prefix_size, max_prefix_size], plus None for no-cartridge case.
+
+            Returns:
+                List of cartridge sizes: [None, size1, size2, ...]
+            """
+            cartridge_cases = [None]  # None = no cartridge
+            min_size = self.compilation_config.min_prefix_size
+            max_size = self.compilation_config.max_prefix_size
+
+            if min_size > 0:
+                import math
+                size = 2 ** math.ceil(math.log2(min_size))
+                while size <= max_size:
+                    cartridge_cases.append(size)
+                    size *= 2
+
+            return cartridge_cases
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -4614,8 +4627,8 @@ class GPUModelRunner(
             else:
                 lora_cases = [False]
 
-            # Add cartridge cases: None (no cartridge) and 4096 (standard cartridge length)
-            cartridge_cases = [None, 4096]
+            # Generate cartridge cases dynamically from config
+            cartridge_cases = self._generate_cartridge_cases()
 
             if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
                 cudagraph_runtime_mode = cudagraph_mode.mixed_mode()
@@ -5012,23 +5025,16 @@ class GPUModelRunner(
         assert cudagraph_mode is not None
         # Include cartridge cases: None (no cartridge) and supported cartridge lengths
         # Each size requires separate CUDA graphs due to different tensor shapes
-        # Generate power-of-2 sizes within the range [min_prefix_size, max_prefix_size]
-        cartridge_cases = [None]  # None = no cartridge
-        min_size = self.compilation_config.min_prefix_size
-        max_size = self.compilation_config.max_prefix_size
-
-        # Find smallest power of 2 >= min_size
-        if min_size > 0:
-            size = 2 ** math.ceil(math.log2(min_size))
-            while size <= max_size:
-                cartridge_cases.append(size)
-                size *= 2
+        cartridge_cases = self._generate_cartridge_cases()
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, self.uniform_decode_query_len, cartridge_cases
         )
-        logger.info(f"Configured cartridge cases for CUDA graphs: {cartridge_cases} "
-                   f"(min_prefix_size={min_size}, max_prefix_size={max_size})")
+        logger.info(
+            f"Configured cartridge cases for CUDA graphs: {cartridge_cases} "
+            f"(min_prefix_size={self.compilation_config.min_prefix_size}, "
+            f"max_prefix_size={self.compilation_config.max_prefix_size})"
+        )
 
     def calculate_reorder_batch_threshold(self) -> None:
         """

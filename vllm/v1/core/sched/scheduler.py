@@ -237,7 +237,7 @@ class Scheduler(SchedulerInterface):
             elif request.cartridge_id != batch_cartridge_id:
                 # Different cartridge - skip this request for now
                 # It will be scheduled in a future batch
-                logger.debug(
+                logger.info(
                     "Skipping running request %s with cartridge_id=%s (batch has cartridge_id=%s)",
                     request.request_id,
                     request.cartridge_id,
@@ -473,7 +473,7 @@ class Scheduler(SchedulerInterface):
                     batch_cartridge_id = request.cartridge_id
                 elif request.cartridge_id != batch_cartridge_id:
                     # Different cartridge - skip this request and schedule in next batch
-                    logger.debug(
+                    logger.info(
                         "Skipping request %s with cartridge_id=%s (batch has cartridge_id=%s)",
                         request.request_id,
                         request.cartridge_id,
@@ -772,7 +772,7 @@ class Scheduler(SchedulerInterface):
                 + len(scheduled_resumed_reqs)
                 + len(scheduled_running_reqs)
             )
-            logger.debug(
+            logger.info(
                 "Scheduled batch with cartridge_id=%s (%d requests)",
                 batch_cartridge_id,
                 num_reqs_in_batch,
