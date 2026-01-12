@@ -378,6 +378,8 @@ class EngineArgs:
     max_cudagraph_capture_size: int | None = get_field(
         CompilationConfig, "max_cudagraph_capture_size"
     )
+    min_prefix_size: int = CompilationConfig.min_prefix_size
+    max_prefix_size: int = CompilationConfig.max_prefix_size
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
@@ -1733,6 +1735,20 @@ class EngineArgs:
             compilation_config.max_cudagraph_capture_size = (
                 self.max_cudagraph_capture_size
             )
+        if self.min_prefix_size is not None:
+            if compilation_config.min_prefix_size is not None:
+                raise ValueError(
+                    "min_prefix_size and compilation_config."
+                    "min_prefix_size are mutually exclusive"
+                )
+            compilation_config.min_prefix_size = self.min_prefix_size
+        if self.max_prefix_size is not None:
+            if compilation_config.max_prefix_size is not None:
+                raise ValueError(
+                    "max_prefix_size and compilation_config."
+                    "max_prefix_size are mutually exclusive"
+                )
+            compilation_config.max_prefix_size = self.max_prefix_size
 
         config = VllmConfig(
             model_config=model_config,

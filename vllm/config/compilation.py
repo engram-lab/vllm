@@ -452,6 +452,24 @@ class CompilationConfig:
     When `enable_lora` is False, this option has no effect.
     """
 
+    min_prefix_size: int = 2048
+    """Minimum prefix (cartridge) size for CUDA graph capture.
+    When using prefix adapters (cartridges), CUDA graphs will be captured for
+    power-of-2 sizes within the range [min_prefix_size, max_prefix_size].
+    For example, if min_prefix_size=2048 and max_prefix_size=8192, CUDA graphs
+    will be captured for sizes [2048, 4096, 8192]. If min_prefix_size=3000 and
+    max_prefix_size=10000, CUDA graphs will be captured for [4096, 8192].
+    Cartridges with sizes matching these captured sizes will use CUDA graphs,
+    while others will fall back to eager execution.
+    """
+
+    max_prefix_size: int = 8192
+    """Maximum prefix (cartridge) size for CUDA graph capture.
+    When using prefix adapters (cartridges), CUDA graphs will be captured for
+    power-of-2 sizes within the range [min_prefix_size, max_prefix_size].
+    See min_prefix_size for details on how CUDA graph sizes are determined.
+    """
+
     use_inductor_graph_partition: bool = False
     """Use inductor graph partition to split the graph at cudagraph_unsafe ops.
     This partition happens at inductor codegen time after all passes and fusions
@@ -663,6 +681,21 @@ class CompilationConfig:
         count_none = self.custom_ops.count("none")
         count_all = self.custom_ops.count("all")
         assert count_none + count_all <= 1, "Can only specify 'none' or 'all'"
+
+        # Validate prefix size settings
+        if self.min_prefix_size <= 0:
+            raise ValueError(
+                f"min_prefix_size must be positive, got {self.min_prefix_size}"
+            )
+        if self.max_prefix_size <= 0:
+            raise ValueError(
+                f"max_prefix_size must be positive, got {self.max_prefix_size}"
+            )
+        if self.min_prefix_size > self.max_prefix_size:
+            raise ValueError(
+                f"min_prefix_size ({self.min_prefix_size}) must be <= "
+                f"max_prefix_size ({self.max_prefix_size})"
+            )
 
         # TODO(zou3519/luka): There are 2 issues with auto-functionalization V2:
         # 1. A bug in PyTorch, fixed in 2.7:

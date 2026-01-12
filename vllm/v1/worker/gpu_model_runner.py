@@ -4,6 +4,7 @@
 import gc
 import itertools
 import time
+import math
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -5011,11 +5012,23 @@ class GPUModelRunner(
         assert cudagraph_mode is not None
         # Include cartridge cases: None (no cartridge) and supported cartridge lengths
         # Each size requires separate CUDA graphs due to different tensor shapes
-        cartridge_cases = [None, 4096, 8192]
+        # Generate power-of-2 sizes within the range [min_prefix_size, max_prefix_size]
+        cartridge_cases = [None]  # None = no cartridge
+        min_size = self.compilation_config.min_prefix_size
+        max_size = self.compilation_config.max_prefix_size
+
+        # Find smallest power of 2 >= min_size
+        if min_size > 0:
+            size = 2 ** math.ceil(math.log2(min_size))
+            while size <= max_size:
+                cartridge_cases.append(size)
+                size *= 2
+
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, self.uniform_decode_query_len, cartridge_cases
         )
-        logger.info(f"Configured cartridge cases for CUDA graphs: {cartridge_cases}")
+        logger.info(f"Configured cartridge cases for CUDA graphs: {cartridge_cases} "
+                   f"(min_prefix_size={min_size}, max_prefix_size={max_size})")
 
     def calculate_reorder_batch_threshold(self) -> None:
         """

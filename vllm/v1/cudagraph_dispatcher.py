@@ -165,13 +165,27 @@ class CudagraphDispatcher:
             return CUDAGraphMode.PIECEWISE, non_uniform_key
 
         # finally, just return no cudagraphs
-        # Log when no match is found for debugging
+        # Warn when a cartridge request doesn't match any CUDA graph
         import logging
         logger = logging.getLogger(__name__)
         if batch_descriptor.cartridge_id is not None:
-            logger.debug(
-                f"No CUDA graph match for batch_descriptor: {batch_descriptor}. "
-                f"Available FULL keys: {len(self.cudagraph_keys[CUDAGraphMode.FULL])}, "
-                f"PIECEWISE keys: {len(self.cudagraph_keys[CUDAGraphMode.PIECEWISE])}"
+            # Extract supported cartridge sizes from registered keys
+            supported_sizes = set()
+            for mode in [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE]:
+                for key in self.cudagraph_keys[mode]:
+                    if key.cartridge_id is not None:
+                        # Extract size from cartridge_id format "cart_XXXX"
+                        try:
+                            size = int(key.cartridge_id.split('_')[1])
+                            supported_sizes.add(size)
+                        except (IndexError, ValueError):
+                            pass
+
+            supported_sizes_list = sorted(list(supported_sizes))
+            logger.warning(
+                f"No CUDA graph match for cartridge request with cartridge_id='{batch_descriptor.cartridge_id}'. "
+                f"Falling back to eager execution. "
+                f"Supported cartridge sizes for CUDA graphs: {supported_sizes_list}. "
+                f"To add support for this size, adjust --min-prefix-size or --max-prefix-size."
             )
         return CUDAGraphMode.NONE, None
