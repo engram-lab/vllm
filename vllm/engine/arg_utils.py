@@ -1085,6 +1085,14 @@ class EngineArgs:
             "--max-cudagraph-capture-size",
             **compilation_kwargs["max_cudagraph_capture_size"],
         )
+        compilation_group.add_argument(
+            "--min-prefix-size",
+            **compilation_kwargs["min_prefix_size"],
+        )
+        compilation_group.add_argument(
+            "--max-prefix-size",
+            **compilation_kwargs["max_prefix_size"],
+        )
 
         # vLLM arguments
         vllm_kwargs = get_kwargs(VllmConfig)
@@ -1735,20 +1743,9 @@ class EngineArgs:
             compilation_config.max_cudagraph_capture_size = (
                 self.max_cudagraph_capture_size
             )
-        if self.min_prefix_size is not None:
-            if compilation_config.min_prefix_size is not None:
-                raise ValueError(
-                    "min_prefix_size and compilation_config."
-                    "min_prefix_size are mutually exclusive"
-                )
-            compilation_config.min_prefix_size = self.min_prefix_size
-        if self.max_prefix_size is not None:
-            if compilation_config.max_prefix_size is not None:
-                raise ValueError(
-                    "max_prefix_size and compilation_config."
-                    "max_prefix_size are mutually exclusive"
-                )
-            compilation_config.max_prefix_size = self.max_prefix_size
+        # Always set prefix size from CLI args (they have non-None defaults)
+        compilation_config.min_prefix_size = self.min_prefix_size
+        compilation_config.max_prefix_size = self.max_prefix_size
 
         config = VllmConfig(
             model_config=model_config,
