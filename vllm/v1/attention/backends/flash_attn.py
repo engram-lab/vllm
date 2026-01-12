@@ -604,12 +604,18 @@ class FlashAttentionImpl(AttentionImpl):
 
         The cartridge KV acts like a "soft prompt" that all tokens can attend to.
         """
+        from vllm.forward_context import get_forward_context
+        from vllm.config.compilation import CUDAGraphMode
+
         cartridge_k, cartridge_v = cartridge_kv
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_seqs = attn_metadata.query_start_loc.shape[0] - 1
 
-        # CUDA events for timing (compatible with CUDA graphs)
-        enable_timing = num_actual_tokens <= 32  # Only time during decode
+        # Disable timing during CUDA graph capture/replay to maintain compatibility
+        forward_context = get_forward_context()
+        cudagraph_active = forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+        enable_timing = num_actual_tokens <= 32 and not cudagraph_active
+
         if enable_timing:
             start_event = torch.cuda.Event(enable_timing=True)
             prep_event = torch.cuda.Event(enable_timing=True)
@@ -617,36 +623,49 @@ class FlashAttentionImpl(AttentionImpl):
             pass2_event = torch.cuda.Event(enable_timing=True)
             merge_event = torch.cuda.Event(enable_timing=True)
             start_event.record()
-        
+
         # Cartridge shape: (num_kv_heads_per_gpu, seq_len, head_size) - already sharded for TP
         # This should match self.num_kv_heads which is the per-GPU KV head count
         cartridge_seq_len = cartridge_k.shape[1]
-        
+
         # Reshape cartridge KV to flash attention format: (seq_len, num_kv_heads, head_size)
         # Use .to() with non_blocking for async dtype conversion
         cartridge_k_t = cartridge_k.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
         cartridge_v_t = cartridge_v.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
 
         # For cartridge attention, each sequence attends to the same cartridge KV.
-        # Optimize for common single-sequence case to avoid memory allocation.
+        # Use expand() instead of repeat() to avoid allocations (CUDA graph compatible)
         if num_seqs == 1:
             # Single sequence - no replication needed
             cartridge_k_batch = cartridge_k_t
             cartridge_v_batch = cartridge_v_t
-            cu_seqlens_k_cartridge = torch.tensor(
-                [0, cartridge_seq_len], device=query.device, dtype=torch.int32
-            )
+            # Pre-allocate cu_seqlens buffer if needed (CUDA graph compatible)
+            if not hasattr(self, '_cu_seqlens_cartridge_1seq') or self._cu_seqlens_cartridge_1seq_len != cartridge_seq_len:
+                self._cu_seqlens_cartridge_1seq = torch.tensor(
+                    [0, cartridge_seq_len], device=query.device, dtype=torch.int32
+                )
+                self._cu_seqlens_cartridge_1seq_len = cartridge_seq_len
+            cu_seqlens_k_cartridge = self._cu_seqlens_cartridge_1seq
         else:
-            # Multiple sequences - replicate cartridge for each
-            # Build cu_seqlens for cartridge (each seq has same cartridge length)
-            cu_seqlens_k_cartridge = torch.arange(
-                0, (num_seqs + 1) * cartridge_seq_len, cartridge_seq_len,
-                device=query.device, dtype=torch.int32
+            # Multiple sequences - use expand() to avoid allocation
+            # expand() creates a view without copying data, compatible with CUDA graphs
+            cartridge_k_batch = cartridge_k_t.expand(num_seqs * cartridge_seq_len, -1, -1).reshape(
+                num_seqs * cartridge_seq_len, cartridge_k_t.shape[1], cartridge_k_t.shape[2]
             )
-            # Replicate: (seq_len, num_kv_heads, head_size) -> (num_seqs * seq_len, num_kv_heads, head_size)
-            # Using repeat() is more memory-efficient than expand().contiguous().reshape()
-            cartridge_k_batch = cartridge_k_t.repeat(num_seqs, 1, 1)
-            cartridge_v_batch = cartridge_v_t.repeat(num_seqs, 1, 1)
+            cartridge_v_batch = cartridge_v_t.expand(num_seqs * cartridge_seq_len, -1, -1).reshape(
+                num_seqs * cartridge_seq_len, cartridge_v_t.shape[1], cartridge_v_t.shape[2]
+            )
+            # Build cu_seqlens for cartridge (each seq has same cartridge length)
+            # Cache this for common batch sizes
+            cache_key = (num_seqs, cartridge_seq_len)
+            if not hasattr(self, '_cu_seqlens_cartridge_cache'):
+                self._cu_seqlens_cartridge_cache = {}
+            if cache_key not in self._cu_seqlens_cartridge_cache:
+                self._cu_seqlens_cartridge_cache[cache_key] = torch.arange(
+                    0, (num_seqs + 1) * cartridge_seq_len, cartridge_seq_len,
+                    device=query.device, dtype=torch.int32
+                )
+            cu_seqlens_k_cartridge = self._cu_seqlens_cartridge_cache[cache_key]
 
         if enable_timing:
             prep_event.record()
@@ -886,7 +905,12 @@ class FlashAttentionImpl(AttentionImpl):
                 return output
             else:
                 # Timing for regular (non-cartridge) path for comparison
-                enable_timing = num_actual_tokens <= 32
+                # Disable during CUDA graph mode
+                from vllm.forward_context import get_forward_context
+                from vllm.config.compilation import CUDAGraphMode
+                forward_context = get_forward_context()
+                cudagraph_active = forward_context.cudagraph_runtime_mode != CUDAGraphMode.NONE
+                enable_timing = num_actual_tokens <= 32 and not cudagraph_active
                 if enable_timing:
                     start_event = torch.cuda.Event(enable_timing=True)
                     end_event = torch.cuda.Event(enable_timing=True)

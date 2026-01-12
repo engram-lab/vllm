@@ -1040,19 +1040,24 @@ class GPUModelRunner(
     ) -> str | None:
         """Get the cartridge_id for the current batch if any requests have cartridges.
 
-        This is used to differentiate CUDA graphs - batches with different cartridges
-        need separate graphs since cartridge KV tensors have different memory addresses.
+        Returns a marker string based on cartridge sequence length to dispatch to
+        the appropriate CUDA graph.
 
         Returns:
-            The cartridge_id of the first request with a cartridge, or None if no
-            requests have cartridges. If multiple cartridges exist, only the first
-            is returned (matching _get_cartridge_kv_for_batch behavior).
+            "cart_{seq_len}" if any request has cartridges, None otherwise.
         """
+        # Check if any request in the batch has active cartridges
         scheduled_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+
         for req_id in scheduled_req_ids:
-            cartridge_ref = self.cartridge_kv_refs.get(req_id)
-            if cartridge_ref is not None:
-                return cartridge_ref[2]  # (keys, values, cartridge_id)
+            if req_id in self.cartridge_kv_refs:
+                # Get the cartridge seq_len from the first layer
+                cartridge_ref = self.cartridge_kv_refs[req_id]
+                stacked_keys = cartridge_ref[0]  # (num_layers, num_kv_heads, seq_len, head_dim)
+                cartridge_seq_len = stacked_keys.shape[2]
+                # Return marker to dispatch to the correct CUDA graph
+                return f"cart_{cartridge_seq_len}"
+
         return None
 
     def _get_cartridge_kv_for_batch(
@@ -3957,6 +3962,7 @@ class GPUModelRunner(
         remove_lora: bool = True,
         activate_lora: bool = False,
         is_graph_capturing: bool = False,
+        cartridge_seq_len: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -3980,6 +3986,8 @@ class GPUModelRunner(
                 (1 token) and prefill (multiple tokens) requests.
             remove_lora: If False, dummy LoRAs are not destroyed after the run
             activate_lora: If False, dummy_run is performed without LoRAs.
+            cartridge_seq_len: If provided, create dummy cartridge KV tensors
+                with this sequence length for CUDA graph capture.
         """
         assert (
             cudagraph_runtime_mode is None
@@ -4056,18 +4064,34 @@ class GPUModelRunner(
             num_tokens_after_padding = int(num_tokens_across_dp[dp_rank])
 
         # filter out the valid batch descriptor
-        _cg_mode, batch_descriptor = (
-            self.cudagraph_dispatcher.dispatch(
+        # For cartridge dummy runs, create a cartridge marker to differentiate graphs
+        cartridge_marker = f"cart_{cartridge_seq_len}" if cartridge_seq_len else None
+
+        # During graph capture, skip dispatcher query and use passed mode directly
+        # The dispatcher doesn't have the graph yet (we're capturing it!)
+        if is_graph_capturing or is_profile:
+            _cg_mode = cudagraph_runtime_mode if cudagraph_runtime_mode is not None else CUDAGraphMode.NONE
+            batch_descriptor = (
                 BatchDescriptor(
                     num_tokens=num_tokens_after_padding,
                     uniform_decode=uniform_decode,
                     has_lora=activate_lora and self.lora_config is not None,
-                    cartridge_id=None,  # Dummy runs don't use cartridges
+                    cartridge_id=cartridge_marker,
+                )
+                if not is_profile
+                else None
+            )
+        else:
+            # Normal execution - query dispatcher for matching graph
+            _cg_mode, batch_descriptor = self.cudagraph_dispatcher.dispatch(
+                BatchDescriptor(
+                    num_tokens=num_tokens_after_padding,
+                    uniform_decode=uniform_decode,
+                    has_lora=activate_lora and self.lora_config is not None,
+                    cartridge_id=cartridge_marker,
                 )
             )
-            if not is_profile
-            else (CUDAGraphMode.NONE, None)
-        )
+
         if cudagraph_runtime_mode is not None:
             # we allow forcing NONE when the dispatcher disagrees to support
             # warm ups for cudagraph capture
@@ -4165,6 +4189,33 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_after_padding
 
+            # Create dummy cartridge KV for CUDA graph capture if requested
+            dummy_cartridge_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+            if cartridge_seq_len is not None and len(self.attn_groups) > 0:
+                # Get dimensions from the first attention group's KV cache spec
+                first_attn_group = self.attn_groups[0][0]
+                kv_cache_spec = first_attn_group.kv_cache_spec
+                num_kv_heads = kv_cache_spec.num_kv_heads
+                head_size = kv_cache_spec.head_size
+
+                # Get the number of attention layers this worker handles
+                num_layers = self.model_config.get_num_layers_by_block_type(
+                    self.parallel_config, "attention"
+                )
+
+                # Create dummy KV tensors: (num_kv_heads, seq_len, head_size)
+                dummy_cartridge_kv = {}
+                for layer_idx in range(num_layers):
+                    dummy_k = torch.zeros(
+                        num_kv_heads, cartridge_seq_len, head_size,
+                        device=self.device, dtype=self.model_config.dtype
+                    )
+                    dummy_v = torch.zeros(
+                        num_kv_heads, cartridge_seq_len, head_size,
+                        device=self.device, dtype=self.model_config.dtype
+                    )
+                    dummy_cartridge_kv[layer_idx] = (dummy_k, dummy_v)
+
             with (
                 self.maybe_randomize_inputs(input_ids),
                 set_forward_context(
@@ -4175,6 +4226,7 @@ class GPUModelRunner(
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     ubatch_slices=ubatch_slices,
+                    cartridge_kv=dummy_cartridge_kv,
                 ),
             ):
                 outputs = self.model(
@@ -4523,11 +4575,14 @@ class GPUModelRunner(
             else:
                 lora_cases = [False]
 
+            # Add cartridge cases: None (no cartridge) and 4096 (standard cartridge length)
+            cartridge_cases = [None, 4096]
+
             if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
                 cudagraph_runtime_mode = cudagraph_mode.mixed_mode()
                 # make sure we capture the largest batch size first
                 compilation_cases = list(
-                    product(reversed(self.cudagraph_batch_sizes), lora_cases)
+                    product(reversed(self.cudagraph_batch_sizes), lora_cases, cartridge_cases)
                 )
                 self._capture_cudagraphs(
                     compilation_cases,
@@ -4550,7 +4605,7 @@ class GPUModelRunner(
                     if max_num_tokens >= x >= self.uniform_decode_query_len
                 ]
                 compilation_cases_decode = list(
-                    product(reversed(decode_cudagraph_batch_sizes), lora_cases)
+                    product(reversed(decode_cudagraph_batch_sizes), lora_cases, cartridge_cases)
                 )
                 self._capture_cudagraphs(
                     compilation_cases=compilation_cases_decode,
@@ -4582,7 +4637,7 @@ class GPUModelRunner(
 
     def _capture_cudagraphs(
         self,
-        compilation_cases: list[tuple[int, bool]],
+        compilation_cases: list[tuple[int, bool, int | None]],
         cudagraph_runtime_mode: CUDAGraphMode,
         uniform_decode: bool,
     ):
@@ -4603,7 +4658,7 @@ class GPUModelRunner(
             )
 
         # We skip EPLB here since we don't want to record dummy metrics
-        for num_tokens, activate_lora in compilation_cases:
+        for num_tokens, activate_lora, cartridge_seq_len in compilation_cases:
             # We currently only capture ubatched graphs when its a FULL
             # cudagraph, a uniform decode batch, and the number of tokens
             # is above the threshold. Otherwise we just capture a non-ubatched
@@ -4635,6 +4690,7 @@ class GPUModelRunner(
                     skip_eplb=True,
                     remove_lora=False,
                     activate_lora=activate_lora,
+                    cartridge_seq_len=cartridge_seq_len,
                 )
             self._dummy_run(
                 num_tokens,
@@ -4645,6 +4701,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 activate_lora=activate_lora,
                 is_graph_capturing=True,
+                cartridge_seq_len=cartridge_seq_len,
             )
         self.maybe_remove_all_loras(self.lora_config)
 
