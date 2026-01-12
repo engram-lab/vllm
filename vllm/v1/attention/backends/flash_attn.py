@@ -647,14 +647,17 @@ class FlashAttentionImpl(AttentionImpl):
                 self._cu_seqlens_cartridge_1seq_len = cartridge_seq_len
             cu_seqlens_k_cartridge = self._cu_seqlens_cartridge_1seq
         else:
-            # Multiple sequences - use expand() to avoid allocation
+            # Multiple sequences - use unsqueeze + expand to avoid allocation
             # expand() creates a view without copying data, compatible with CUDA graphs
-            cartridge_k_batch = cartridge_k_t.expand(num_seqs * cartridge_seq_len, -1, -1).reshape(
-                num_seqs * cartridge_seq_len, cartridge_k_t.shape[1], cartridge_k_t.shape[2]
-            )
-            cartridge_v_batch = cartridge_v_t.expand(num_seqs * cartridge_seq_len, -1, -1).reshape(
-                num_seqs * cartridge_seq_len, cartridge_v_t.shape[1], cartridge_v_t.shape[2]
-            )
+            # Shape: (seq_len, num_kv_heads, head_size) -> (1, seq_len, num_kv_heads, head_size)
+            #     -> (num_seqs, seq_len, num_kv_heads, head_size) -> (num_seqs*seq_len, num_kv_heads, head_size)
+            cartridge_k_batch = cartridge_k_t.unsqueeze(0).expand(
+                num_seqs, -1, -1, -1
+            ).reshape(num_seqs * cartridge_seq_len, cartridge_k_t.shape[1], cartridge_k_t.shape[2])
+
+            cartridge_v_batch = cartridge_v_t.unsqueeze(0).expand(
+                num_seqs, -1, -1, -1
+            ).reshape(num_seqs * cartridge_seq_len, cartridge_v_t.shape[1], cartridge_v_t.shape[2])
             # Build cu_seqlens for cartridge (each seq has same cartridge length)
             # Cache this for common batch sizes
             cache_key = (num_seqs, cartridge_seq_len)
