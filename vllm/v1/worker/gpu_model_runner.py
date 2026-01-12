@@ -4560,6 +4560,28 @@ class GPUModelRunner(
         self.encoder_cache.clear()
         gc.collect()
 
+    def _generate_cartridge_cases(self) -> list[int | None]:
+        """Generate cartridge cases for CUDA graph capture.
+
+        Returns a list of cartridge sizes (power-of-2) within the range
+        [min_prefix_size, max_prefix_size], plus None for no-cartridge case.
+
+        Returns:
+            List of cartridge sizes: [None, size1, size2, ...]
+        """
+        cartridge_cases = [None]  # None = no cartridge
+        min_size = self.compilation_config.min_prefix_size
+        max_size = self.compilation_config.max_prefix_size
+
+        if min_size > 0:
+            import math
+            size = 2 ** math.ceil(math.log2(min_size))
+            while size <= max_size:
+                cartridge_cases.append(size)
+                size *= 2
+
+        return cartridge_cases
+
     def capture_model(self) -> int:
         if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
             logger.warning(
@@ -4587,28 +4609,6 @@ class GPUModelRunner(
                 if should_freeze:
                     gc.unfreeze()
                     gc.collect()
-
-        def _generate_cartridge_cases(self) -> list[int | None]:
-            """Generate cartridge cases for CUDA graph capture.
-
-            Returns a list of cartridge sizes (power-of-2) within the range
-            [min_prefix_size, max_prefix_size], plus None for no-cartridge case.
-
-            Returns:
-                List of cartridge sizes: [None, size1, size2, ...]
-            """
-            cartridge_cases = [None]  # None = no cartridge
-            min_size = self.compilation_config.min_prefix_size
-            max_size = self.compilation_config.max_prefix_size
-
-            if min_size > 0:
-                import math
-                size = 2 ** math.ceil(math.log2(min_size))
-                while size <= max_size:
-                    cartridge_cases.append(size)
-                    size *= 2
-
-            return cartridge_cases
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
