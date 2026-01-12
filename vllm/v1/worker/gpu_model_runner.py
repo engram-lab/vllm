@@ -413,6 +413,10 @@ class GPUModelRunner(
         # Key: cartridge_id (survives IPC serialization, unlike data_ptr)
         # Value: dict[layer_idx, (key_gpu, value_gpu)]
         self._gpu_cartridge_cache: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        # Persistent buffers for cartridge KV tensors (for CUDA graph compatibility).
+        # These buffers have fixed memory addresses and are reused across graph captures/replays.
+        # Key: cartridge_seq_len, Value: dict[layer_idx, (key_buffer, value_buffer)]
+        self._cartridge_kv_persistent_buffers: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
         # Position offset for cartridge requests (for RoPE only, not token indexing)
         # Maps request_id -> cartridge_seq_len
         self.cartridge_position_offsets: dict[str, int] = {}
@@ -1112,24 +1116,43 @@ class GPUModelRunner(
                 )
         
         stacked_keys, stacked_values, cartridge_id = first_ref
-        
+
+        # Get cartridge sequence length from the shape
+        cartridge_seq_len = stacked_keys.shape[2]  # (num_layers, num_kv_heads, seq_len, head_dim)
+
         # Check GPU cache first - keyed by cartridge_id (survives IPC)
-        if cartridge_id in self._gpu_cartridge_cache:
+        if cartridge_id not in self._gpu_cartridge_cache:
+            # Transfer to GPU and cache
+            num_layers = stacked_keys.shape[0]
+            layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            for layer_idx in range(num_layers):
+                layer_kv[layer_idx] = (
+                    stacked_keys[layer_idx].to(self.device, non_blocking=True),
+                    stacked_values[layer_idx].to(self.device, non_blocking=True),
+                )
+
+            self._gpu_cartridge_cache[cartridge_id] = layer_kv
+            logger.debug(f"Transferred cartridge to GPU: {num_layers} layers")
+
+        # For CUDA graph compatibility, copy data into persistent buffers
+        # instead of returning the cached tensors directly
+        if cartridge_seq_len in self._cartridge_kv_persistent_buffers:
+            # Use persistent buffers - copy data into them
+            persistent_buffers = self._cartridge_kv_persistent_buffers[cartridge_seq_len]
+            cached_layer_kv = self._gpu_cartridge_cache[cartridge_id]
+
+            for layer_idx in persistent_buffers.keys():
+                buffer_k, buffer_v = persistent_buffers[layer_idx]
+                cached_k, cached_v = cached_layer_kv[layer_idx]
+                # Copy data into persistent buffers (non-blocking for performance)
+                buffer_k.copy_(cached_k, non_blocking=True)
+                buffer_v.copy_(cached_v, non_blocking=True)
+
+            return persistent_buffers
+        else:
+            # No persistent buffers available - return cached tensors directly
+            # This happens during non-CUDA-graph execution
             return self._gpu_cartridge_cache[cartridge_id]
-        
-        # Transfer to GPU and cache
-        num_layers = stacked_keys.shape[0]
-        layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        for layer_idx in range(num_layers):
-            layer_kv[layer_idx] = (
-                stacked_keys[layer_idx].to(self.device, non_blocking=True),
-                stacked_values[layer_idx].to(self.device, non_blocking=True),
-            )
-        
-        self._gpu_cartridge_cache[cartridge_id] = layer_kv
-        logger.debug(f"Transferred cartridge to GPU: {num_layers} layers")
-        
-        return layer_kv
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
@@ -3078,6 +3101,15 @@ class GPUModelRunner(
                 )
             )
 
+            # Debug logging for cartridge CUDA graph dispatch
+            if batch_desc.cartridge_id is not None:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(
+                    f"CUDAGRAPH_DISPATCH: batch_desc={batch_desc}, "
+                    f"mode={cudagraph_runtime_mode}, matched={batch_descriptor is not None}"
+                )
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -4189,32 +4221,41 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_after_padding
 
-            # Create dummy cartridge KV for CUDA graph capture if requested
+            # Create/reuse persistent cartridge KV buffers for CUDA graph capture if requested
             dummy_cartridge_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
             if cartridge_seq_len is not None and len(self.attn_groups) > 0:
-                # Get dimensions from the first attention group's KV cache spec
-                first_attn_group = self.attn_groups[0][0]
-                kv_cache_spec = first_attn_group.kv_cache_spec
-                num_kv_heads = kv_cache_spec.num_kv_heads
-                head_size = kv_cache_spec.head_size
+                # Check if we already have persistent buffers for this cartridge length
+                if cartridge_seq_len not in self._cartridge_kv_persistent_buffers:
+                    # Get dimensions from the first attention group's KV cache spec
+                    first_attn_group = self.attn_groups[0][0]
+                    kv_cache_spec = first_attn_group.kv_cache_spec
+                    num_kv_heads = kv_cache_spec.num_kv_heads
+                    head_size = kv_cache_spec.head_size
 
-                # Get the number of attention layers this worker handles
-                num_layers = self.model_config.get_num_layers_by_block_type(
-                    self.parallel_config, "attention"
-                )
+                    # Get the number of attention layers this worker handles
+                    num_layers = self.model_config.get_num_layers_by_block_type(
+                        self.parallel_config, "attention"
+                    )
 
-                # Create dummy KV tensors: (num_kv_heads, seq_len, head_size)
-                dummy_cartridge_kv = {}
-                for layer_idx in range(num_layers):
-                    dummy_k = torch.zeros(
-                        num_kv_heads, cartridge_seq_len, head_size,
-                        device=self.device, dtype=self.model_config.dtype
-                    )
-                    dummy_v = torch.zeros(
-                        num_kv_heads, cartridge_seq_len, head_size,
-                        device=self.device, dtype=self.model_config.dtype
-                    )
-                    dummy_cartridge_kv[layer_idx] = (dummy_k, dummy_v)
+                    # Create persistent KV buffers: (num_kv_heads, seq_len, head_size)
+                    # These buffers have fixed memory addresses for CUDA graph compatibility
+                    persistent_buffers = {}
+                    for layer_idx in range(num_layers):
+                        buffer_k = torch.zeros(
+                            num_kv_heads, cartridge_seq_len, head_size,
+                            device=self.device, dtype=self.model_config.dtype
+                        )
+                        buffer_v = torch.zeros(
+                            num_kv_heads, cartridge_seq_len, head_size,
+                            device=self.device, dtype=self.model_config.dtype
+                        )
+                        persistent_buffers[layer_idx] = (buffer_k, buffer_v)
+
+                    self._cartridge_kv_persistent_buffers[cartridge_seq_len] = persistent_buffers
+                    logger.info(f"Created persistent cartridge buffers for seq_len={cartridge_seq_len}, num_layers={num_layers}")
+
+                # Use the persistent buffers for this dummy run
+                dummy_cartridge_kv = self._cartridge_kv_persistent_buffers[cartridge_seq_len]
 
             with (
                 self.maybe_randomize_inputs(input_ids),
