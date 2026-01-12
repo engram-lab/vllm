@@ -1104,16 +1104,13 @@ class GPUModelRunner(
         if first_ref is None:
             return None
         
-        # Log conflict warning only once (rate limited)
+        # Log conflict as error - this should not happen with scheduler-level batching
         if has_conflict:
-            if not hasattr(self, '_mixed_cartridge_warned'):
-                self._mixed_cartridge_warned = True
-                logger.warning(
-                    "Batch has requests with different cartridges. "
-                    "Only the first cartridge will be used for all requests in batch. "
-                    "For correct results, use same cartridge for concurrent requests "
-                    "or reduce MAX_NUM_SEQS to 1."
-                )
+            logger.error(
+                "BUG: Batch has requests with different cartridges! "
+                "The scheduler should prevent this. Only the first cartridge will be used. "
+                "This indicates a bug in scheduler cartridge batching logic."
+            )
         
         stacked_keys, stacked_values, cartridge_id = first_ref
 
@@ -4674,6 +4671,19 @@ class GPUModelRunner(
             cuda_graph_size / (1 << 30),
             scope="local",
         )
+
+        # Log cartridge persistent buffer allocation summary
+        if self._cartridge_kv_persistent_buffers:
+            buffer_sizes = list(self._cartridge_kv_persistent_buffers.keys())
+            total_cartridge_memory = 0
+            for buffers in self._cartridge_kv_persistent_buffers.values():
+                for k, v in buffers.values():
+                    total_cartridge_memory += (k.numel() + v.numel()) * k.element_size()
+            logger.info(
+                f"Cartridge persistent buffers allocated for sizes: {buffer_sizes}, "
+                f"total memory: {total_cartridge_memory / (1 << 30):.2f} GiB"
+            )
+
         return cuda_graph_size
 
     def _capture_cudagraphs(
@@ -4999,11 +5009,13 @@ class GPUModelRunner(
         # resolved cudagraph mode.
         cudagraph_mode = self.compilation_config.cudagraph_mode
         assert cudagraph_mode is not None
-        # Include cartridge cases: None (no cartridge) and 4096 (standard cartridge length)
-        cartridge_cases = [None, 4096]
+        # Include cartridge cases: None (no cartridge) and supported cartridge lengths
+        # Each size requires separate CUDA graphs due to different tensor shapes
+        cartridge_cases = [None, 4096, 8192]
         self.cudagraph_dispatcher.initialize_cudagraph_keys(
             cudagraph_mode, self.uniform_decode_query_len, cartridge_cases
         )
+        logger.info(f"Configured cartridge cases for CUDA graphs: {cartridge_cases}")
 
     def calculate_reorder_batch_threshold(self) -> None:
         """

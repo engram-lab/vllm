@@ -217,6 +217,10 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
+        # Cartridge-related: Track the cartridge_id for this batch.
+        # All requests in a batch must have the same cartridge_id.
+        batch_cartridge_id: str | None = None
+
         # For logging.
         scheduled_timestamp = time.monotonic()
 
@@ -224,6 +228,23 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # Check cartridge compatibility: all requests in a batch must have
+            # the same cartridge_id (or None). Skip requests with incompatible cartridges.
+            if batch_cartridge_id is None:
+                # First request in batch - set the cartridge_id
+                batch_cartridge_id = request.cartridge_id
+            elif request.cartridge_id != batch_cartridge_id:
+                # Different cartridge - skip this request for now
+                # It will be scheduled in a future batch
+                logger.debug(
+                    "Skipping running request %s with cartridge_id=%s (batch has cartridge_id=%s)",
+                    request.request_id,
+                    request.cartridge_id,
+                    batch_cartridge_id,
+                )
+                req_index += 1
+                continue
 
             num_new_tokens = (
                 request.num_tokens_with_spec
@@ -441,6 +462,23 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
+
+                # Check cartridge compatibility: all requests in a batch must have
+                # the same cartridge_id (or None).
+                if batch_cartridge_id is None:
+                    # First request in batch - set the cartridge_id
+                    batch_cartridge_id = request.cartridge_id
+                elif request.cartridge_id != batch_cartridge_id:
+                    # Different cartridge - skip this request and schedule in next batch
+                    logger.debug(
+                        "Skipping request %s with cartridge_id=%s (batch has cartridge_id=%s)",
+                        request.request_id,
+                        request.cartridge_id,
+                        batch_cartridge_id,
+                    )
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -726,6 +764,19 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
+
+        # Log cartridge batching info for debugging
+        if batch_cartridge_id is not None:
+            num_reqs_in_batch = (
+                len(scheduled_new_reqs)
+                + len(scheduled_resumed_reqs)
+                + len(scheduled_running_reqs)
+            )
+            logger.debug(
+                "Scheduled batch with cartridge_id=%s (%d requests)",
+                batch_cartridge_id,
+                num_reqs_in_batch,
+            )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
