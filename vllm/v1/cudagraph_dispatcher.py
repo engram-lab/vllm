@@ -169,8 +169,9 @@ class CudagraphDispatcher:
         import logging
         logger = logging.getLogger(__name__)
         if batch_descriptor.cartridge_id is not None:
-            # Extract supported cartridge sizes from registered keys
+            # Extract supported cartridge sizes and matching keys from registered keys
             supported_sizes = set()
+            matching_cart_keys = []
             for mode in [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE]:
                 for key in self.cudagraph_keys[mode]:
                     if key.cartridge_id is not None:
@@ -178,14 +179,20 @@ class CudagraphDispatcher:
                         try:
                             size = int(key.cartridge_id.split('_')[1])
                             supported_sizes.add(size)
+                            # Collect keys matching this cartridge_id
+                            if key.cartridge_id == batch_descriptor.cartridge_id:
+                                matching_cart_keys.append(key)
                         except (IndexError, ValueError):
                             pass
 
             supported_sizes_list = sorted(list(supported_sizes))
             logger.warning(
-                f"No CUDA graph match for cartridge request with cartridge_id='{batch_descriptor.cartridge_id}'. "
+                f"No CUDA graph match for cartridge request. "
+                f"Request descriptor: {batch_descriptor}. "
                 f"Falling back to eager execution. "
+                f"Matching cartridge_id keys: {matching_cart_keys}. "
                 f"Supported cartridge sizes for CUDA graphs: {supported_sizes_list}. "
-                f"To add support for this size, adjust --min-prefix-size or --max-prefix-size."
+                f"If the cartridge size is supported but num_tokens doesn't match, "
+                f"adjust --cudagraph-capture-sizes to include this batch size."
             )
         return CUDAGraphMode.NONE, None

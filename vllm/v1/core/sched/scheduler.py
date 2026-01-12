@@ -237,12 +237,6 @@ class Scheduler(SchedulerInterface):
             elif request.cartridge_id != batch_cartridge_id:
                 # Different cartridge - skip this request for now
                 # It will be scheduled in a future batch
-                logger.info(
-                    "Skipping running request %s with cartridge_id=%s (batch has cartridge_id=%s)",
-                    request.request_id,
-                    request.cartridge_id,
-                    batch_cartridge_id,
-                )
                 req_index += 1
                 continue
 
@@ -473,12 +467,6 @@ class Scheduler(SchedulerInterface):
                     batch_cartridge_id = request.cartridge_id
                 elif request.cartridge_id != batch_cartridge_id:
                     # Different cartridge - skip this request and schedule in next batch
-                    logger.info(
-                        "Skipping request %s with cartridge_id=%s (batch has cartridge_id=%s)",
-                        request.request_id,
-                        request.cartridge_id,
-                        batch_cartridge_id,
-                    )
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
                     continue
@@ -764,19 +752,6 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.ec_connector_metadata = ec_meta
-
-        # Log cartridge batching info for debugging
-        if batch_cartridge_id is not None:
-            num_reqs_in_batch = (
-                len(scheduled_new_reqs)
-                + len(scheduled_resumed_reqs)
-                + len(scheduled_running_reqs)
-            )
-            logger.info(
-                "Scheduled batch with cartridge_id=%s (%d requests)",
-                batch_cartridge_id,
-                num_reqs_in_batch,
-            )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
