@@ -226,11 +226,15 @@ class OpenAIServingCompletion(OpenAIServing):
                     adapters_dict = None
                     logger.warning(f"[ADAPTER DEBUG] request.adapters = {request.adapters}")
                     if request.adapters:
-                        logger.warning(f"[ADAPTER DEBUG] Adapters found! Converting to dict...")
-                        adapters_dict = request.adapters.model_dump()
-                        logger.warning(f"[ADAPTER DEBUG] adapters_dict = {adapters_dict}")
-                    else:
-                        logger.warning(f"[ADAPTER DEBUG] No adapters in request")
+                        # logger.warning(f"[ADAPTER DEBUG] Adapters found! Converting to dict...")
+                        # Handle both Pydantic models and dicts
+                        if isinstance(request.adapters, dict):
+                            adapters_dict = request.adapters
+                        else:
+                            adapters_dict = request.adapters.model_dump()
+                        # logger.warning(f"[ADAPTER DEBUG] adapters_dict = {adapters_dict}")
+                    # else:
+                        # logger.warning(f"[ADAPTER DEBUG] No adapters in request")
                     
                     # Process all adapters (prefix + lora)
                     if adapters_dict:
