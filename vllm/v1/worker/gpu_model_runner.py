@@ -1067,15 +1067,17 @@ class GPUModelRunner(
                     # Cache on GPU for future requests with same cartridge
                     self.gpu_cartridge_cache[cartridge_id] = (stacked_keys, stacked_values)
                 
-                # Pre-populate cartridge KV into this request's cache blocks
-                self._prepopulate_cartridge_to_cache(
-                    new_req_data.block_ids, stacked_keys, stacked_values
-                )
-                
+                # Only pre-populate cartridge KV if prefix cache didn't already cover it.
+                # When num_computed_tokens >= cart_seq_len, the cartridge blocks are
+                # already filled from prefix cache hit - skip the expensive kernel calls.
+                if new_req_data.num_computed_tokens < cart_seq_len:
+                    self._prepopulate_cartridge_to_cache(
+                        new_req_data.block_ids, stacked_keys, stacked_values
+                    )
+                else:
+                    pass
                 # Store position offset - input tokens need positions/slots offset by cart_seq_len
                 self.cartridge_position_offsets[req_id] = cart_seq_len
-                logger.debug(f"Pre-populated cartridge for request {req_id}: "
-                            f"{stacked_keys.shape[0]} layers, seq_len={cart_seq_len}")
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
