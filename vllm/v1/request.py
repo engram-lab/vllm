@@ -111,6 +111,13 @@ class Request:
         # Cartridge identifier for deduplication across IPC
         self.cartridge_id = cartridge_id
 
+        # Track cartridge sequence length (occupies cache positions 0 to cart_seq_len-1)
+        if cartridge_kv is not None:
+            # cartridge_kv is [keys, values] where keys.shape = (num_layers, num_heads, seq_len, head_dim)
+            self.cartridge_seq_len = cartridge_kv[0].shape[2]
+        else:
+            self.cartridge_seq_len = 0
+
         # Read-only views
         # Prevent directly appending to these lists since
         # they should also be updated simultaneously.

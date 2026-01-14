@@ -265,8 +265,12 @@ class KVCacheManager:
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
         num_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
+
+        # Add cartridge length to allocate space for cartridge KV in cache
+        cartridge_len = getattr(request, 'cartridge_seq_len', 0)
+
         num_tokens_need_slot = min(
-            num_computed_tokens + num_new_tokens + num_lookahead_tokens,
+            num_computed_tokens + num_new_tokens + num_lookahead_tokens + cartridge_len,
             self.max_model_len,
         )
 

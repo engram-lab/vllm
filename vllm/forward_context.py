@@ -44,11 +44,6 @@ class BatchDescriptor(NamedTuple):
     """
     Whether this batch has active LoRA adapters.
     """
-    cartridge_id: str | None = None
-    """
-    Cartridge ID for this batch. Different cartridges must use different
-    CUDA graphs since the cartridge KV cache tensors have different addresses.
-    """
 
     @property
     def non_uniform(self) -> "BatchDescriptor":
@@ -59,7 +54,6 @@ class BatchDescriptor(NamedTuple):
             self.num_tokens,
             uniform_decode=False,
             has_lora=self.has_lora,
-            cartridge_id=self.cartridge_id,
         )
 
 
@@ -210,11 +204,6 @@ class ForwardContext:
     batch_descriptor: BatchDescriptor | None = None
 
     ubatch_slices: UBatchSlices | None = None
-    
-    # Learned cartridge KV cache to prepend to attention
-    # Maps layer index -> (key_tensor, value_tensor)
-    # Key/value shape: (num_kv_heads, seq_len, head_size)
-    cartridge_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
@@ -246,7 +235,6 @@ def create_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
-    cartridge_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -256,7 +244,6 @@ def create_forward_context(
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
-        cartridge_kv=cartridge_kv,
     )
 
 
@@ -285,7 +272,6 @@ def set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
-    cartridge_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -331,7 +317,6 @@ def set_forward_context(
         cudagraph_runtime_mode,
         batch_descriptor,
         ubatch_slices,
-        cartridge_kv,
     )
 
     try:
