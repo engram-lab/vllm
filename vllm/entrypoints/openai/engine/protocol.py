@@ -230,6 +230,44 @@ class FunctionDefinition(OpenAIBaseModel):
     parameters: dict[str, Any] | None = None
 
 
+class AdapterSpec(OpenAIBaseModel):
+    """Base specification for an adapter (prefix, LoRA, currently supported)."""
+
+    id: str = Field(
+        description=(
+            "The identifier/path to the adapter. For S3 sources, this should be "
+            "an S3 URI (e.g., 's3://bucket/path/to/adapter'). "
+            "For local sources, this should be a file path."
+        ),
+    )
+    source: Literal["s3", "local"] = Field(
+        default="s3",
+        description=(
+            "The source type of the adapter. Supports: s3, local, wandb, huggingface"
+        ),
+    )
+    force_redownload: bool = Field(
+        default=False,
+        description=(
+            "If true, force redownload the adapter even if it exists in the cache. "
+            "If false, use cached version if available."
+        ),
+    )
+
+
+class AdaptersConfig(OpenAIBaseModel):
+    """Configuration for multiple adapter types in a request."""
+
+    prefix: list[AdapterSpec] | None = Field(
+        default=None,
+        description="List of prefix/cartridge adapters to load (learned KV cache)",
+    )
+    lora: list[AdapterSpec] | None = Field(
+        default=None,
+        description="List of LoRA adapters to load (low-rank weight deltas)",
+    )
+
+
 # extra="forbid" is a workaround to have kwargs as a field,
 # see https://github.com/pydantic/pydantic/issues/3125
 class LogitsProcessorConstructor(BaseModel):
