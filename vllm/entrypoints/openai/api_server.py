@@ -47,11 +47,6 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_se
 from vllm.entrypoints.openai.engine.protocol import (
     CompletionRequest,
     CompletionResponse,
-    DetokenizeRequest,
-    DetokenizeResponse,
-    EmbeddingBytesResponse,
-    EmbeddingRequest,
-    EmbeddingResponse,
     ErrorInfo,
     ErrorResponse,
     ResponsesRequest,

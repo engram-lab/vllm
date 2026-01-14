@@ -12,6 +12,7 @@ from http import HTTPStatus
 from typing import Any, ClassVar, Generic, TypeAlias, TypeVar
 
 import numpy as np
+import torch
 from fastapi import Request
 from openai.types.responses import (
     ToolChoiceFunction,
@@ -46,11 +47,6 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.engine.protocol import (
     CompletionRequest,
     CompletionResponse,
-    DetokenizeRequest,
-    EmbeddingChatRequest,
-    EmbeddingCompletionRequest,
-    EmbeddingRequest,
-    EmbeddingResponse,
     ErrorInfo,
     ErrorResponse,
     FunctionCall,
@@ -1060,46 +1056,6 @@ class OpenAIServing:
                 traceback.print_exc()
             else:
                 traceback.print_stack()
-
-        debug_info = None
-        if envs.VLLM_PASSTHROUGH_ERRORS:
-            # Include debug info for internal servers
-            stack_trace = None
-            exc_type, _, tb = sys.exc_info()
-            if exc_type is not None:
-                stack_trace = "".join(traceback.format_exception(exc_type, value=None, tb=tb))
-
-            # Extract request metadata (not full prompts for security)
-            num_prompt_tokens = None
-            num_messages = None
-            model = None
-            adapter_ids = None
-            temperature = None
-            max_tokens = None
-
-            if request is not None:
-                model = getattr(request, "model", None)
-                temperature = getattr(request, "temperature", None)
-                max_tokens = getattr(request, "max_tokens", None)
-                # Get adapter IDs if available
-                adapters = getattr(request, "adapters", None)
-                if adapters:
-                    adapter_ids = [getattr(a, "id", str(a)) for a in adapters]
-                # Count messages for chat requests
-                messages = getattr(request, "messages", None)
-                if messages:
-                    num_messages = len(messages)
-
-            debug_info = ErrorDebugInfo(
-                request_id=request_id,
-                stack_trace=stack_trace,
-                num_prompt_tokens=num_prompt_tokens,
-                num_messages=num_messages,
-                model=model,
-                adapter_ids=adapter_ids,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
 
         return ErrorResponse(
             error=ErrorInfo(
