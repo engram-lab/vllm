@@ -406,7 +406,11 @@ class OpenAIServingChat(OpenAIServing):
                 # Convert adapters config to dict if present
                 adapters_dict = None
                 if request.adapters:
-                    adapters_dict = request.adapters.model_dump()
+                    # Handle both Pydantic models and dicts
+                    if isinstance(request.adapters, dict):
+                        adapters_dict = request.adapters
+                    else:
+                        adapters_dict = request.adapters.model_dump()
                 
                 # Process all adapters (prefix + lora)
                 if adapters_dict:
