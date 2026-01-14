@@ -19,6 +19,7 @@ from pydantic import (
 
 from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
 from vllm.entrypoints.openai.engine.protocol import (
+    AdaptersConfig,
     AnyResponseFormat,
     DeltaMessage,
     FunctionCall,
@@ -343,6 +344,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
+    )
+
+    adapters: AdaptersConfig | None = Field(
+        default=None,
+        description=(
+            "Adapters configuration for this request. Supports prefix (KV cache) "
+            "and LoRA adapters that can be loaded from S3, local storage, etc."
+        ),
     )
 
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
