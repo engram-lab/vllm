@@ -483,6 +483,9 @@ class GPUModelRunner(
         # so input tokens need their positions and slot_mapping offset by cart_seq_len.
         # Maps request_id -> cartridge_seq_len
         self.cartridge_position_offsets: dict[str, int] = {}
+        # GPU cache for cartridge KV tensors to avoid repeated CPU->GPU transfers.
+        # Maps cartridge_id -> (stacked_keys, stacked_values) on GPU
+        self.gpu_cartridge_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self.comm_stream = torch.cuda.Stream()
 
         # Input Batch
@@ -1015,45 +1018,56 @@ class GPUModelRunner(
             # The cartridge occupies cache slots 0..cart_seq_len-1, and input tokens
             # will be offset to start at slot cart_seq_len.
             if new_req_data.cartridge_kv is not None and new_req_data.cartridge_id is not None:
-                stacked_keys, stacked_values = new_req_data.cartridge_kv
+                cartridge_id = new_req_data.cartridge_id
                 
-                # Validate cartridge dimensions match model architecture
-                total_kv_heads = self.model_config.get_total_num_kv_heads()
-                expected_head_size = self.model_config.get_head_size()
-                expected_num_layers = self.model_config.get_num_layers(self.parallel_config)
-                cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
-                if cart_num_layers != expected_num_layers:
-                    raise ValueError(
-                        f"Cartridge incompatible with model: num_layers={cart_num_layers} "
-                        f"but model expects {expected_num_layers}. "
-                        f"Cartridge may have been trained on a different model."
-                    )
-                if cart_kv_heads != total_kv_heads:
-                    raise ValueError(
-                        f"Cartridge incompatible with model: num_kv_heads={cart_kv_heads} "
-                        f"but model expects {total_kv_heads}. "
-                        f"Cartridge may have been trained on a different model."
-                    )
-                if cart_head_dim != expected_head_size:
-                    raise ValueError(
-                        f"Cartridge incompatible with model: head_dim={cart_head_dim} "
-                        f"but model expects {expected_head_size}. "
-                        f"Cartridge may have been trained on a different model."
-                    )
+                # Check GPU cache first to avoid repeated CPU->GPU transfers
+                if cartridge_id in self.gpu_cartridge_cache:
+                    # Use cached GPU tensors (already sharded for TP)
+                    stacked_keys, stacked_values = self.gpu_cartridge_cache[cartridge_id]
+                    cart_seq_len = stacked_keys.shape[2]
+                else:
+                    # First time seeing this cartridge - validate, shard, and cache
+                    stacked_keys, stacked_values = new_req_data.cartridge_kv
+                    
+                    # Validate cartridge dimensions match model architecture
+                    total_kv_heads = self.model_config.get_total_num_kv_heads()
+                    expected_head_size = self.model_config.get_head_size()
+                    expected_num_layers = self.model_config.get_num_layers(self.parallel_config)
+                    cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
+                    if cart_num_layers != expected_num_layers:
+                        raise ValueError(
+                            f"Cartridge incompatible with model: num_layers={cart_num_layers} "
+                            f"but model expects {expected_num_layers}. "
+                            f"Cartridge may have been trained on a different model."
+                        )
+                    if cart_kv_heads != total_kv_heads:
+                        raise ValueError(
+                            f"Cartridge incompatible with model: num_kv_heads={cart_kv_heads} "
+                            f"but model expects {total_kv_heads}. "
+                            f"Cartridge may have been trained on a different model."
+                        )
+                    if cart_head_dim != expected_head_size:
+                        raise ValueError(
+                            f"Cartridge incompatible with model: head_dim={cart_head_dim} "
+                            f"but model expects {expected_head_size}. "
+                            f"Cartridge may have been trained on a different model."
+                        )
+                    
+                    # Shard cartridge KV for tensor parallelism
+                    tp_size = self.parallel_config.tensor_parallel_size
+                    if tp_size > 1 and total_kv_heads >= tp_size:
+                        tp_rank = get_tp_group().rank_in_group
+                        heads_per_gpu = total_kv_heads // tp_size
+                        start_head = tp_rank * heads_per_gpu
+                        end_head = start_head + heads_per_gpu
+                        stacked_keys = stacked_keys[:, start_head:end_head, :, :].contiguous()
+                        stacked_values = stacked_values[:, start_head:end_head, :, :].contiguous()
+                        logger.debug(f"Sharded cartridge KV for TP rank {tp_rank}: heads [{start_head}:{end_head}]")
+                    
+                    # Cache on GPU for future requests with same cartridge
+                    self.gpu_cartridge_cache[cartridge_id] = (stacked_keys, stacked_values)
                 
-                # Shard cartridge KV for tensor parallelism (matching how model shards KV heads)
-                tp_size = self.parallel_config.tensor_parallel_size
-                if tp_size > 1 and total_kv_heads >= tp_size:
-                    tp_rank = get_tp_group().rank_in_group
-                    heads_per_gpu = total_kv_heads // tp_size
-                    start_head = tp_rank * heads_per_gpu
-                    end_head = start_head + heads_per_gpu
-                    # Slice: (num_layers, total_kv_heads, seq_len, head_dim) -> (num_layers, heads_per_gpu, seq_len, head_dim)
-                    stacked_keys = stacked_keys[:, start_head:end_head, :, :].contiguous()
-                    stacked_values = stacked_values[:, start_head:end_head, :, :].contiguous()
-                    logger.debug(f"Sharded cartridge KV for TP rank {tp_rank}: heads [{start_head}:{end_head}]")
-                
-                # Pre-populate cartridge KV into the cache
+                # Pre-populate cartridge KV into this request's cache blocks
                 self._prepopulate_cartridge_to_cache(
                     new_req_data.block_ids, stacked_keys, stacked_values
                 )
