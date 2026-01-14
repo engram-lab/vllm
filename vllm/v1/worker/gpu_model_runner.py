@@ -20,17 +20,15 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.attention.layer import Attention, MLAAttention
-from vllm.attention.backends.abstract import (
+from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     MultipleOf,
 )
-from vllm.attention.utils.fa_utils import (
+from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
+    reshape_and_cache_flash,
 )
-
-if is_flash_attn_varlen_func_available():
-    from vllm.attention.utils.fa_utils import reshape_and_cache_flash
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
