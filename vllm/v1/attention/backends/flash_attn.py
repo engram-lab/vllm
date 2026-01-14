@@ -558,289 +558,9 @@ class FlashAttentionImpl(AttentionImpl):
     def supports_quant_query_input(self) -> bool:
         return True
 
-    def _get_cartridge_kv_for_layer(
-        self, layer: torch.nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Get cartridge KV for this layer if available.
-        
-        Returns:
-            Tuple of (key, value) tensors with shape 
-            (num_kv_heads, seq_len, head_size) or None if no cartridge.
-        """
-        from vllm.forward_context import get_forward_context
-        
-        forward_context = get_forward_context()
-        if forward_context.cartridge_kv is None:
-            return None
-        
-        # Extract layer index from layer name (e.g., "model.layers.5.self_attn" -> 5)
-        layer_name = getattr(layer, 'layer_name', '')
-        import re
-        match = re.search(r'layers\.(\d+)', layer_name)
-        if match is None:
-            logger.warning(f"Could not extract layer index from layer_name='{layer_name}'")
-            return None
-        
-        layer_idx = int(match.group(1))
-        return forward_context.cartridge_kv.get(layer_idx)
-
-    def _forward_with_cartridge_inject(
-        self,
-        layer: torch.nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-        output: torch.Tensor,
-        cartridge_kv: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """Inject cartridge KV into cache during first prefill, then use normal attention.
-
-        This method writes the cartridge KV into the first cartridge_seq_len cache positions,
-        then writes the input KV into subsequent positions, and runs normal single-pass attention.
-        This is much more efficient than the two-pass approach in _forward_with_cartridge().
-        """
-        cartridge_k, cartridge_v = cartridge_kv
-        num_actual_tokens = attn_metadata.num_actual_tokens
-
-        # Cartridge shape: (num_kv_heads_per_gpu, seq_len, head_size)
-        # Reshape to: (seq_len, num_kv_heads, head_size) and convert dtype
-        cart_seq_len = cartridge_k.shape[1]
-        logger.warning(f"[CART DEBUG] Cartridge shape BEFORE transpose: K={cartridge_k.shape}, V={cartridge_v.shape}")
-        cartridge_k_formatted = cartridge_k.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
-        cartridge_v_formatted = cartridge_v.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
-        logger.warning(f"[CART DEBUG] Cartridge shape AFTER transpose: K={cartridge_k_formatted.shape}, V={cartridge_v_formatted.shape}")
-
-        # Get cache
-        key_cache, value_cache = kv_cache.unbind(0)
-
-        # Build slot mapping for cartridge: positions 0 to cart_seq_len-1
-        # Compute slots from block_table using same logic as scheduler:
-        # slot = physical_block * block_size + block_offset
-
-        # Infer block_size from the slot_mapping and block_table
-        # slot_mapping[0] corresponds to first input token (after cartridge)
-        # If block_table[0, 0] is the first block and slot_mapping[0] is in that block:
-        # block_size can be computed from the slot value
-        # Standard vLLM default is 16
-        first_input_slot = attn_metadata.slot_mapping[0].item()
-        first_block_num = attn_metadata.block_table[0, 0].item()
-        block_size = first_input_slot // first_block_num if first_block_num > 0 else 16
-
-        positions = torch.arange(cart_seq_len, device=cartridge_k_formatted.device, dtype=torch.long)
-        virtual_blocks = positions // block_size
-        block_offsets = positions % block_size
-
-        # Get physical blocks from block_table (assume single sequence during prefill)
-        # block_table shape: (num_seqs, max_num_blocks)
-        physical_blocks = attn_metadata.block_table[0, virtual_blocks]
-
-        # Compute slot indices
-        cartridge_slots = physical_blocks * block_size + block_offsets
-
-        logger.warning(f"[CART DEBUG] block_size={block_size}, cart_seq_len={cart_seq_len}")
-        logger.warning(f"[CART DEBUG] cartridge_slots: first 5={cartridge_slots[:5].tolist()}, last 5={cartridge_slots[-5:].tolist()}")
-        logger.warning(f"[CART DEBUG] input slot_mapping BEFORE offset: first 5={attn_metadata.slot_mapping[:5].tolist()}")
-
-        # Write cartridge KV to cache
-        reshape_and_cache_flash(
-            cartridge_k_formatted, cartridge_v_formatted,
-            key_cache, value_cache,
-            cartridge_slots, self.kv_cache_dtype,
-            layer._k_scale, layer._v_scale,
-        )
-
-        # Write input KV to cache with offset to avoid overwriting cartridge
-        # Cartridge occupies slots 0 to cart_seq_len-1, input tokens start at cart_seq_len
-        if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
-            offset_slot_mapping = attn_metadata.slot_mapping + cart_seq_len
-            reshape_and_cache_flash(
-                key, value, key_cache, value_cache,
-                offset_slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale, layer._v_scale,
-            )
-
-        # Now run normal single-pass attention over the entire cache (cartridge + input)
-        if self.kv_cache_dtype.startswith("fp8"):
-            dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(self.kv_cache_dtype)
-            key_cache = key_cache.view(dtype)
-            value_cache = value_cache.view(dtype)
-
-        # Adjust seq_lens to include cartridge length
-        # seq_lens tells flash attention how many cached tokens to attend to
-        cu_seqlens_q = attn_metadata.query_start_loc
-
-        # DEBUG: Check seq_lens before adjustment
-        logger.warning(f"[CART DEBUG PREFILL] seq_lens BEFORE: {attn_metadata.seq_lens.tolist()[:5] if attn_metadata.seq_lens.numel() > 0 else 'empty'}")
-        logger.warning(f"[CART DEBUG PREFILL] max_query_len: {attn_metadata.max_query_len}, max_seq_len: {attn_metadata.max_seq_len}")
-        logger.warning(f"[CART DEBUG PREFILL] cart_seq_len to add: {cart_seq_len}")
-
-        seqused_k = attn_metadata.seq_lens + cart_seq_len  # Add cartridge length
-        max_seqlen_q = attn_metadata.max_query_len
-        max_seqlen_k = attn_metadata.max_seq_len + cart_seq_len  # Add cartridge length
-
-        logger.warning(f"[CART DEBUG PREFILL] seqused_k AFTER: {seqused_k.tolist()[:5] if seqused_k.numel() > 0 else 'empty'}, max_seqlen_k: {max_seqlen_k}")
-        block_table = attn_metadata.block_table
-        scheduler_metadata = attn_metadata.scheduler_metadata
-        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-
-        flash_attn_varlen_func(
-            q=query[:num_actual_tokens],
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=self.scale,
-            causal=attn_metadata.causal,
-            alibi_slopes=self.alibi_slopes,
-            window_size=self.sliding_window,
-            block_table=block_table,
-            softcap=self.logits_soft_cap,
-            scheduler_metadata=scheduler_metadata,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=layer._q_scale.expand(descale_shape),
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
-            num_splits=attn_metadata.max_num_splits,
-            s_aux=self.sinks,
-            return_softmax_lse=False,
-            out=output[:num_actual_tokens],
-        )
-
-        return output
-
-    def _forward_with_cartridge(
-        self,
-        layer: torch.nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
-        output: torch.Tensor,
-        cartridge_kv: tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """Forward pass with learned cartridge KV prepended.
-        
-        This runs attention twice:
-        1. Attention over the cartridge KV (prefix) - all queries attend to cartridge
-        2. Attention over the regular KV cache (suffix)
-        Then merges the results using log-sum-exp weights.
-        
-        The cartridge KV acts like a "soft prompt" that all tokens can attend to.
-        """
-        cartridge_k, cartridge_v = cartridge_kv
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        num_seqs = attn_metadata.query_start_loc.shape[0] - 1
-        
-        # Cartridge shape: (num_kv_heads_per_gpu, seq_len, head_size) - already sharded for TP
-        # This should match self.num_kv_heads which is the per-GPU KV head count
-        cartridge_seq_len = cartridge_k.shape[1]
-        
-        # Reshape cartridge KV to flash attention format: (seq_len, num_kv_heads, head_size)
-        # Use .to() with non_blocking for async dtype conversion
-        cartridge_k_t = cartridge_k.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
-        cartridge_v_t = cartridge_v.transpose(0, 1).contiguous().to(query.dtype, non_blocking=True)
-        
-        # For cartridge attention, each sequence attends to the same cartridge KV.
-        # Optimize for common single-sequence case to avoid memory allocation.
-        if num_seqs == 1:
-            # Single sequence - no replication needed
-            cartridge_k_batch = cartridge_k_t
-            cartridge_v_batch = cartridge_v_t
-            cu_seqlens_k_cartridge = torch.tensor(
-                [0, cartridge_seq_len], device=query.device, dtype=torch.int32
-            )
-        else:
-            # Multiple sequences - replicate cartridge for each
-            # Build cu_seqlens for cartridge (each seq has same cartridge length)
-            cu_seqlens_k_cartridge = torch.arange(
-                0, (num_seqs + 1) * cartridge_seq_len, cartridge_seq_len,
-                device=query.device, dtype=torch.int32
-            )
-            # Replicate: (seq_len, num_kv_heads, head_size) -> (num_seqs * seq_len, num_kv_heads, head_size)
-            # Using repeat() is more memory-efficient than expand().contiguous().reshape()
-            cartridge_k_batch = cartridge_k_t.repeat(num_seqs, 1, 1)
-            cartridge_v_batch = cartridge_v_t.repeat(num_seqs, 1, 1)
-        
-        # Run attention over cartridge KV (non-causal)
-        cartridge_output, cartridge_lse = flash_attn_varlen_func(
-            q=query[:num_actual_tokens],
-            k=cartridge_k_batch,
-            v=cartridge_v_batch,
-            cu_seqlens_q=attn_metadata.query_start_loc,
-            cu_seqlens_k=cu_seqlens_k_cartridge,
-            max_seqlen_q=attn_metadata.max_query_len,
-            max_seqlen_k=cartridge_seq_len,
-            softmax_scale=self.scale,
-            causal=False,  # Cartridge attention is non-causal
-            return_softmax_lse=True,
-            fa_version=self.vllm_flash_attn_version,
-        )
-        
-        # Run regular attention with KV cache
-        key_cache, value_cache = kv_cache.unbind(0)
-        
-        if self.kv_sharing_target_layer_name is None and key is not None and value is not None:
-            reshape_and_cache_flash(
-                key, value, key_cache, value_cache,
-                attn_metadata.slot_mapping, self.kv_cache_dtype,
-                layer._k_scale, layer._v_scale,
-            )
-        
-        if self.kv_cache_dtype.startswith("fp8"):
-            dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(self.kv_cache_dtype)
-            key_cache = key_cache.view(dtype)
-            value_cache = value_cache.view(dtype)
-        
-        cu_seqlens_q = attn_metadata.query_start_loc
-        seqused_k = attn_metadata.seq_lens
-        max_seqlen_q = attn_metadata.max_query_len
-        max_seqlen_k = attn_metadata.max_seq_len
-        block_table = attn_metadata.block_table
-        scheduler_metadata = attn_metadata.scheduler_metadata
-        descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
-        
-        
-        suffix_output, suffix_lse = flash_attn_varlen_func(
-            q=query[:num_actual_tokens],
-            k=key_cache,
-            v=value_cache,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=self.scale,
-            causal=attn_metadata.causal,
-            alibi_slopes=self.alibi_slopes,
-            window_size=self.sliding_window,
-            block_table=block_table,
-            softcap=self.logits_soft_cap,
-            scheduler_metadata=scheduler_metadata,
-            fa_version=self.vllm_flash_attn_version,
-            q_descale=layer._q_scale.expand(descale_shape),
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
-            num_splits=attn_metadata.max_num_splits,
-            s_aux=self.sinks,
-            return_softmax_lse=True,
-        )
-        
-        # Merge cartridge and suffix attention outputs using log-sum-exp
-        # FA returns LSE in shape [num_heads, num_tokens] which merge_attn_states expects
-        merge_attn_states(
-            output[:num_actual_tokens],
-            cartridge_output,
-            cartridge_lse,
-            suffix_output,
-            suffix_lse,
-        )
-        
-        return output
+    # NOTE: Cartridge KV is now pre-populated into the cache during request initialization
+    # in gpu_model_runner._update_states(). The positions and seq_lens are already adjusted
+    # to account for the cartridge, so attention just works normally without special handling.
 
     def forward(
         self,
@@ -893,10 +613,6 @@ class FlashAttentionImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Check for learned cartridge KV to prepend
-        cartridge_kv = self._get_cartridge_kv_for_layer(layer)
-        logger.warning(f"[CART DEBUG FORWARD] cartridge_kv={'Found' if cartridge_kv is not None else 'None'}, max_query_len={attn_metadata.max_query_len if attn_metadata else 'N/A'}")
-
         # Handle encoder attention differently - no KV cache needed
         if attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
@@ -909,18 +625,6 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_metadata,
                 layer,
             )
-
-        # If we have learned cartridge KV, inject it into cache during first prefill
-        cart_seq_len = 0
-        if cartridge_kv is not None:
-            cart_seq_len = cartridge_kv[0].shape[1]  # (num_kv_heads, seq_len, head_size)
-            # Only inject cartridge during prefill (max_query_len > 1)
-            # During decode, cartridge is already in cache, so use normal path
-            if attn_metadata.max_query_len > 1:
-                return self._forward_with_cartridge_inject(
-                    layer, query, key, value, kv_cache, attn_metadata, output, cartridge_kv
-                )
-            # Decode: cartridge already in cache, but we need to adjust slot_mapping and seq_lens
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
@@ -940,18 +644,12 @@ class FlashAttentionImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
-
-            # If cartridge exists, offset slot_mapping since cartridge occupies slots 0 to cart_seq_len-1
-            slot_mapping = attn_metadata.slot_mapping
-            if cart_seq_len > 0:
-                slot_mapping = slot_mapping + cart_seq_len
-
             reshape_and_cache_flash(
                 key,
                 value,
                 key_cache,
                 value_cache,
-                slot_mapping,
+                attn_metadata.slot_mapping,
                 self.kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,
@@ -970,12 +668,6 @@ class FlashAttentionImpl(AttentionImpl):
             seqused_k = attn_metadata.seq_lens
             max_seqlen_q = attn_metadata.max_query_len
             max_seqlen_k = attn_metadata.max_seq_len
-
-            # If cartridge exists, add its length to seq_lens so attention covers it
-            if cart_seq_len > 0:
-                seqused_k = seqused_k + cart_seq_len
-                max_seqlen_k = max_seqlen_k + cart_seq_len
-
             block_table = attn_metadata.block_table
             scheduler_metadata = attn_metadata.scheduler_metadata
 
