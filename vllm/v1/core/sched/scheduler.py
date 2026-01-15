@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -60,6 +61,9 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+_CARTRIDGE_DEBUG_TIMING = os.getenv(
+    "VLLM_CARTRIDGE_DEBUG_TIMING", ""
+).lower() in {"1", "true", "yes"}
 
 
 class Scheduler(SchedulerInterface):
@@ -267,6 +271,7 @@ class Scheduler(SchedulerInterface):
         preempted_reqs: list[Request] = []
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        req_to_cartridge_cache_hit: dict[str, bool] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
@@ -520,6 +525,32 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    cart_seq_len = getattr(request, "cartridge_seq_len", 0)
+                    if cart_seq_len > 0:
+                        num_cart_blocks = (
+                            cart_seq_len + self.block_size - 1
+                        ) // self.block_size
+                        cartridge_cache_hit = all(
+                            len(group) >= num_cart_blocks
+                            for group in new_computed_blocks.blocks
+                        )
+                        req_to_cartridge_cache_hit[request.request_id] = (
+                            cartridge_cache_hit
+                        )
+                        if _CARTRIDGE_DEBUG_TIMING:
+                            logger.info(
+                                "[cartridge] req=%s cart_seq_len=%d num_cart_blocks=%d "
+                                "prefix_cache_hit=%s new_computed_tokens=%d "
+                                "computed_blocks_lens=%s",
+                                request.request_id,
+                                cart_seq_len,
+                                num_cart_blocks,
+                                cartridge_cache_hit,
+                                num_new_local_computed_tokens,
+                                [len(g) for g in new_computed_blocks.blocks],
+                            )
+                    else:
+                        req_to_cartridge_cache_hit[request.request_id] = False
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -550,6 +581,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+                    req_to_cartridge_cache_hit[request.request_id] = False
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -559,26 +591,75 @@ class Scheduler(SchedulerInterface):
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
                     num_new_tokens = 0
+                    budget_cost = 0
                 else:
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    
+                    # For cartridge cache MISS, count cart_seq_len in budget
+                    # (need to load cartridge). For cache HIT, don't count
+                    # (cartridge already in memory, shared via prefix cache).
+                    # Note: budget_cost is for scheduling limits, num_new_tokens
+                    # is for tracking actual tokens computed.
+                    cart_seq_len = getattr(request, "cartridge_seq_len", 0)
+                    cartridge_cache_hit = req_to_cartridge_cache_hit.get(
+                        request.request_id, False
+                    )
+                    if cart_seq_len > 0 and not cartridge_cache_hit:
+                        budget_cost = num_new_tokens + cart_seq_len
+                    else:
+                        budget_cost = num_new_tokens
+                    
+                    if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
+                        logger.info(
+                            "[cartridge-sched] req=%s cache_hit=%s num_new_tokens=%d "
+                            "budget_cost=%d token_budget=%d num_running=%d num_waiting=%d",
+                            request.request_id,
+                            cartridge_cache_hit,
+                            num_new_tokens,
+                            budget_cost,
+                            token_budget,
+                            len(self.running),
+                            len(self.waiting),
+                        )
+                    
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+                        budget_cost = num_new_tokens
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if (
                         not self.scheduler_config.enable_chunked_prefill
-                        and num_new_tokens > token_budget
+                        and budget_cost > token_budget
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
+                            logger.info(
+                                "[cartridge-sched] BREAK (chunked_prefill disabled) "
+                                "req=%s budget_cost=%d token_budget=%d",
+                                request.request_id,
+                                budget_cost,
+                                token_budget,
+                            )
                         break
 
+                    if budget_cost > token_budget:
+                        # Not enough budget for this cartridge request
+                        if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
+                            logger.info(
+                                "[cartridge-sched] BREAK (over budget) "
+                                "req=%s budget_cost=%d token_budget=%d",
+                                request.request_id,
+                                budget_cost,
+                                token_budget,
+                            )
+                        break
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
 
@@ -676,7 +757,16 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.get_blocks(request.request_id)
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
-                token_budget -= num_new_tokens
+                token_budget -= budget_cost
+                if _CARTRIDGE_DEBUG_TIMING and getattr(request, "cartridge_seq_len", 0) > 0:
+                    logger.info(
+                        "[cartridge-sched] SCHEDULED req=%s num_new_tokens=%d "
+                        "budget_cost=%d remaining_budget=%d",
+                        request.request_id,
+                        num_new_tokens,
+                        budget_cost,
+                        token_budget,
+                    )
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -735,13 +825,17 @@ class Scheduler(SchedulerInterface):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    req_to_cartridge_cache_hit.get(req.request_id, False),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    None,
+                    req_to_cartridge_cache_hit.get(req.request_id, False),
                 )
                 for req in scheduled_new_reqs
             ]

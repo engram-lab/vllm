@@ -186,12 +186,20 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
+        # For cartridge requests, include cartridge tokens so those blocks can be matched.
+        cart_seq_len = getattr(request, 'cartridge_seq_len', 0)
+        max_cache_hit_length = request.num_tokens + cart_seq_len - 1
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
+        # For scheduling, subtract cartridge tokens from num_computed_tokens.
+        # The scheduler handles cartridge budget separately based on cache hit.
+        # Also ensure at least 1 token to compute (matching the -1 in max_cache_hit_length).
+        if cart_seq_len > 0 and num_new_computed_tokens > 0:
+            num_new_computed_tokens = max(0, num_new_computed_tokens - cart_seq_len)
+            num_new_computed_tokens = min(num_new_computed_tokens, request.num_tokens - 1)
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -365,9 +373,12 @@ class KVCacheManager:
         # "non-committable" tokens (e.g., draft tokens that could be rejected).
         # Therefore, we cap the number at `request.num_tokens`, ensuring only
         # "finalized" tokens are cached.
+        # For cartridge requests, include cartridge in both the total and cap
+        # so cartridge blocks get cached for prefix sharing.
+        cart_seq_len_alloc = getattr(request, 'cartridge_seq_len', 0)
         num_tokens_to_cache = min(
-            total_computed_tokens + num_new_tokens,
-            request.num_tokens,
+            total_computed_tokens + num_new_tokens + cart_seq_len_alloc,
+            request.num_tokens + cart_seq_len_alloc,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
