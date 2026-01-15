@@ -61,6 +61,11 @@ class NewRequestData:
         prefill_token_ids: list[int] | None = None,
         cartridge_cache_hit: bool = False,
     ) -> "NewRequestData":
+        # When cartridge_cache_hit is True, don't send cartridge_kv via IPC.
+        # The worker already has the tensors cached in gpu_cartridge_cache,
+        # and the KV block cache already has the cartridge blocks populated.
+        # This avoids serializing large tensors (~100s of MB) for every request.
+        cartridge_kv = None if cartridge_cache_hit else request.cartridge_kv
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -72,7 +77,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
-            cartridge_kv=request.cartridge_kv,
+            cartridge_kv=cartridge_kv,
             cartridge_id=request.cartridge_id,
             cartridge_cache_hit=cartridge_cache_hit,
         )

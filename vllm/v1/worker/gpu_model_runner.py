@@ -1016,11 +1016,16 @@ class GPUModelRunner(
             # Pre-populate cartridge KV into cache if present.
             # The cartridge occupies cache slots 0..cart_seq_len-1, and input tokens
             # will be offset to start at slot cart_seq_len.
-            if new_req_data.cartridge_kv is not None and new_req_data.cartridge_id is not None:
+            #
+            # When cartridge_cache_hit is True, cartridge_kv may be None (not sent
+            # via IPC to avoid serializing large tensors). In that case, we use the
+            # cached tensors from gpu_cartridge_cache.
+            if new_req_data.cartridge_id is not None:
                 cartridge_id = new_req_data.cartridge_id
                 prepopulate_ms = 0.0
                 prepare_ms = 0.0
                 gpu_cache_hit = False
+                cartridge_cache_hit = getattr(new_req_data, "cartridge_cache_hit", False)
                 
                 # Check GPU cache first to avoid repeated CPU->GPU transfers and tensor ops
                 if cartridge_id in self.gpu_cartridge_cache:
@@ -1028,7 +1033,7 @@ class GPUModelRunner(
                     layer_kv_list = self.gpu_cartridge_cache[cartridge_id]
                     cart_seq_len = layer_kv_list[0][0].shape[0]  # (seq_len, num_kv_heads, head_dim)
                     gpu_cache_hit = True
-                else:
+                elif new_req_data.cartridge_kv is not None:
                     # First time seeing this cartridge - validate, shard, transpose, and cache
                     stacked_keys, stacked_values = new_req_data.cartridge_kv
                     prepare_start = time.perf_counter()
@@ -1104,8 +1109,16 @@ class GPUModelRunner(
                             prepare_ms,
                             cart_num_layers,
                         )
+                else:
+                    # cartridge_kv is None and not in gpu_cartridge_cache.
+                    # This should only happen if cartridge_cache_hit was incorrectly set.
+                    raise RuntimeError(
+                        f"Cartridge {cartridge_id} not found in gpu_cartridge_cache "
+                        f"but cartridge_kv was not provided. This indicates a bug in "
+                        f"prefix cache hit detection."
+                    )
                 
-                if not getattr(new_req_data, "cartridge_cache_hit", False):
+                if not cartridge_cache_hit:
                     prepopulate_start = time.perf_counter()
                     self._prepopulate_cartridge_to_cache(
                         new_req_data.block_ids, layer_kv_list, cart_seq_len
@@ -1123,7 +1136,7 @@ class GPUModelRunner(
                         req_id,
                         cart_seq_len,
                         gpu_cache_hit,
-                        getattr(new_req_data, "cartridge_cache_hit", False),
+                        cartridge_cache_hit,
                         prepare_ms,
                         prepopulate_ms,
                     )
