@@ -14,7 +14,7 @@
       ]
     }
   },
-  "num_prompts": 100,
+  "num_prompts": 250,
   "prompt_len": 1,
   "output_len": 128,
   "max_concurrency": 50,

@@ -4,7 +4,7 @@
   "model_name": "Qwen/Qwen3-8B",
   "dataset_name": "random",
   "extra_body": null,
-  "num_prompts": 100,
+  "num_prompts": 250,
   "prompt_len": 4096,
   "output_len": 128,
   "max_concurrency": 50,

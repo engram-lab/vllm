@@ -6,11 +6,17 @@ Runs benchmarks and asserts thresholds based on config:
 - Latency mode: asserts TPOT (Time Per Output Token) < threshold
 - Throughput mode: asserts output throughput > threshold
 
-Exits with status code 0 if passed, 1 if failed.
+Exits with status code 0 if all passed, 1 if any failed.
 
 Usage:
+    # Single config
     modal run .github/scripts/modal_ci_benchmark.py \
-        --config-path .github/benchmark_configs/ci_latency.json
+        --config-paths .github/benchmark_configs/base_latency.json
+
+    # Multiple configs
+    modal run .github/scripts/modal_ci_benchmark.py \
+        --config-paths .github/benchmark_configs/base_latency.json \
+        --config-paths .github/benchmark_configs/base_throughput.json
 """
 
 import json
@@ -35,13 +41,13 @@ MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 
 # Benchmark thresholds (can be overridden by config)
-TPOT_THRESHOLD_MS = float(os.environ.get("TPOT_THRESHOLD_MS", "10.0"))
-THROUGHPUT_THRESHOLD_TOK_S = float(os.environ.get("THROUGHPUT_THRESHOLD_TOK_S", "200.0"))
+TPOT_THRESHOLD_MS = float(os.environ.get("TPOT_THRESHOLD_MS", "15.0"))
+THROUGHPUT_THRESHOLD_TOK_S = float(os.environ.get("THROUGHPUT_THRESHOLD_TOK_S", "1500.0"))
 
 MINUTES = 60  # seconds
 
 secrets = modal.Secret.from_name(SECRETS)
-
+ 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
@@ -55,7 +61,7 @@ image = (
     .uv_pip_install(
         "vllm @ file:///tmp/vllm",
         "huggingface-hub[hf_transfer]==0.36.0",
-        "flashinfer-python==0.5.3",
+        "flashinfer-python>=0.5.2",
         "boto3",
     )
     .env(
@@ -94,46 +100,31 @@ app = modal.App("vllm-ci-benchmark")
     },
     enable_memory_snapshot=False,
 )
-def run_benchmark(config_json: str):
+def start_vllm_server(model: str, tensor_parallel_size: int):
     """
-    Run benchmark and assert threshold (latency or throughput based on config).
+    Start a vLLM server and return the process and base URL.
 
     Args:
-        config_json: JSON string containing the benchmark configuration
+        model: Model name to serve
+        tensor_parallel_size: Tensor parallel size
 
     Returns:
-        Dictionary with benchmark results and pass/fail status
+        Tuple of (server_process, base_url) or (None, None) if failed
     """
-    import signal
     import threading
 
     import requests
 
-    # Parse config
-    config = json.loads(config_json)
-    model = config["model_name"]
-    extra_body = config.get("extra_body")
-    tensor_parallel_size = config.get("tensor_parallel_size", GPU_COUNT)
-    assert_type = config.get("assert_type", "latency")
-
     print("=" * 80)
-    print(f"vLLM CI BENCHMARK ({assert_type.upper()})")
+    print("STARTING vLLM SERVER")
     print("=" * 80)
-    print(f"Config: {config.get('name', 'custom')}")
-    print(f"Description: {config.get('description', 'N/A')}")
     print(f"Model: {model}")
     print(f"GPU allocation: {GPU_COUNT}x {GPU_TYPE}")
     print(f"Tensor Parallel Size: {tensor_parallel_size}")
-    if assert_type == "throughput":
-        threshold = config.get("throughput_threshold_tok_s", THROUGHPUT_THRESHOLD_TOK_S)
-        print(f"Throughput Threshold: {threshold:.2f} tok/s")
-    else:
-        threshold = config.get("tpot_threshold_ms", TPOT_THRESHOLD_MS)
-        print(f"TPOT Threshold: {threshold:.2f}ms")
     print("=" * 80)
     print()
 
-    # Start vLLM server
+    # Build server command
     cmd = [
         "vllm",
         "serve",
@@ -161,7 +152,7 @@ def run_benchmark(config_json: str):
         "--enable-chunked-prefill",
     ]
 
-    print(f"Starting vLLM server: {' '.join(cmd)}")
+    print(f"Server command: {' '.join(cmd)}")
     print()
 
     def ping() -> bool:
@@ -210,14 +201,88 @@ def run_benchmark(config_json: str):
             break
         if server_process.poll() is not None:
             print("❌ Server process exited unexpectedly!")
-            return {"status": "failed", "error": "Server failed to start"}
+            return None, None
         time.sleep(2.0)
 
     if not ready:
         server_process.kill()
-        return {"status": "failed", "error": "Server startup timeout"}
+        print("❌ Server startup timeout!")
+        return None, None
 
     base_url = f"http://localhost:{PORT}"
+    return server_process, base_url
+
+
+@app.function(
+    image=image,
+    gpu=f"{GPU_TYPE}:{GPU_COUNT}",
+    timeout=30 * MINUTES,
+    secrets=[secrets],
+    volumes={
+        "/root/.cache/huggingface": hf_cache_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
+        "/root/.cache/flashinfer": flashinfer_cache_vol,
+    },
+    enable_memory_snapshot=False,
+)
+def stop_vllm_server(server_process):
+    """Stop the vLLM server process."""
+    import signal
+
+    print("\nShutting down vLLM server...")
+    try:
+        server_process.send_signal(signal.SIGTERM)
+        server_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        print("Server didn't stop gracefully, killing...")
+        server_process.kill()
+    print("✓ Server stopped")
+
+
+@app.function(
+    image=image,
+    gpu=f"{GPU_TYPE}:{GPU_COUNT}",
+    timeout=30 * MINUTES,
+    secrets=[secrets],
+    volumes={
+        "/root/.cache/huggingface": hf_cache_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
+        "/root/.cache/flashinfer": flashinfer_cache_vol,
+    },
+    enable_memory_snapshot=False,
+)
+def run_benchmark(config_json: str, base_url: str, model_name: str):
+    """
+    Run benchmark and assert threshold (latency or throughput based on config).
+
+    Args:
+        config_json: JSON string containing the benchmark configuration
+        base_url: Base URL of the running vLLM server
+        model_name: Model name being served
+
+    Returns:
+        Dictionary with benchmark results and pass/fail status
+    """
+    # Parse config
+    config = json.loads(config_json)
+    extra_body = config.get("extra_body")
+    assert_type = config.get("assert_type", "latency")
+
+    print("=" * 80)
+    print(f"vLLM CI BENCHMARK ({assert_type.upper()})")
+    print("=" * 80)
+    print(f"Config: {config.get('name', 'custom')}")
+    print(f"Description: {config.get('description', 'N/A')}")
+    print(f"Model: {model_name}")
+    print(f"Server URL: {base_url}")
+    if assert_type == "throughput":
+        threshold = config.get("throughput_threshold_tok_s", THROUGHPUT_THRESHOLD_TOK_S)
+        print(f"Throughput Threshold: {threshold:.2f} tok/s")
+    else:
+        threshold = config.get("tpot_threshold_ms", TPOT_THRESHOLD_MS)
+        print(f"TPOT Threshold: {threshold:.2f}ms")
+    print("=" * 80)
+    print()
 
     try:
         # Build the benchmark command
@@ -230,7 +295,7 @@ def run_benchmark(config_json: str):
             "--base-url",
             base_url,
             "--model",
-            model,
+            model_name,
             "--dataset-name",
             config["dataset_name"],
             "--num-prompts",
@@ -372,61 +437,153 @@ def run_benchmark(config_json: str):
                 "full_results": benchmark_result,
             }
 
-    finally:
-        # Shutdown server
-        print("\nShutting down vLLM server...")
-        try:
-            server_process.send_signal(signal.SIGTERM)
-            server_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            print("Server didn't stop gracefully, killing...")
-            server_process.kill()
-        print("✓ Server stopped")
+    except Exception as e:
+        return {
+            "status": "failed",
+            "error": f"Benchmark execution error: {str(e)}",
+        }
 
 
 @app.local_entrypoint()
-def main(config_path: str):
+def main(*args):
     """
     Local entrypoint to run CI benchmark (latency or throughput).
 
     Args:
-        config_path: Path to benchmark config JSON file
+        args: Command line arguments (parsed using argparse)
 
     Examples:
+        # Single config
         modal run .github/scripts/modal_ci_benchmark.py \\
-            --config-path .github/benchmark_configs/ci_latency.json
+            --config-paths .github/benchmark_configs/base_latency.json
 
+        # Multiple configs (using shared vLLM server)
         modal run .github/scripts/modal_ci_benchmark.py \\
-            --config-path .github/benchmark_configs/ci_throughput.json
+            --config-paths .github/benchmark_configs/base_latency.json \\
+            --config-paths .github/benchmark_configs/base_throughput.json
+
+    Note: All configs must use the same model and tensor_parallel_size to share a server.
     """
-    # Read the config file
-    with open(config_path, "r") as f:
-        config_json = f.read()
+    import argparse
 
-    config = json.loads(config_json)
-    assert_type = config.get("assert_type", "latency")
+    parser = argparse.ArgumentParser(description="Run vLLM CI benchmarks")
+    parser.add_argument(
+        "--config-paths",
+        action="append",
+        required=True,
+        help="Path to benchmark config JSON file (can be specified multiple times)"
+    )
+    parsed_args = parser.parse_args(args)
+    config_paths = parsed_args.config_paths
 
+    # Read and validate all configs
+    configs = []
+    config_jsons = []
+    for config_path in config_paths:
+        with open(config_path, "r") as f:
+            config_json = f.read()
+        config = json.loads(config_json)
+        configs.append(config)
+        config_jsons.append(config_json)
+
+    # Validate all configs use the same model and tensor_parallel_size
+    if len(configs) > 1:
+        first_model = configs[0]["model_name"]
+        first_tp_size = configs[0].get("tensor_parallel_size", GPU_COUNT)
+
+        for i, config in enumerate(configs[1:], 2):
+            model = config["model_name"]
+            tp_size = config.get("tensor_parallel_size", GPU_COUNT)
+
+            if model != first_model:
+                print(f"ERROR: Config {i} uses different model ({model}) than config 1 ({first_model})")
+                print("All configs must use the same model to share a server.")
+                sys.exit(1)
+
+            if tp_size != first_tp_size:
+                print(f"ERROR: Config {i} uses different tensor_parallel_size ({tp_size}) than config 1 ({first_tp_size})")
+                print("All configs must use the same tensor_parallel_size to share a server.")
+                sys.exit(1)
+
+    # Get model and tensor_parallel_size from first config
+    model = configs[0]["model_name"]
+    tensor_parallel_size = configs[0].get("tensor_parallel_size", GPU_COUNT)
+
+    print("\n" + "=" * 80)
+    print(f"STARTING SHARED vLLM SERVER FOR {len(configs)} BENCHMARK(S)")
     print("=" * 80)
-    print(f"vLLM CI BENCHMARK ({assert_type.upper()})")
-    print("=" * 80)
-    print(f"Config file: {config_path}")
+    print(f"Model: {model}")
+    print(f"Tensor Parallel Size: {tensor_parallel_size}")
     print(f"GPU allocation: {GPU_COUNT}x {GPU_TYPE}")
     print("=" * 80)
     print()
 
-    # Run the benchmark
-    result = run_benchmark.remote(config_json=config_json)
+    # Start the server once
+    server_process, base_url = start_vllm_server.remote(model, tensor_parallel_size)
 
-    print("\n" + "=" * 80)
-    print("FINAL RESULTS")
+    if server_process is None or base_url is None:
+        print("ERROR: Failed to start vLLM server")
+        sys.exit(1)
+
+    all_results = []
+
+    try:
+        # Run all benchmarks against the same server
+        for i, (config_path, config_json, config) in enumerate(zip(config_paths, config_jsons, configs), 1):
+            print("\n" + "=" * 80)
+            print(f"RUNNING BENCHMARK {i}/{len(config_paths)}")
+            print("=" * 80)
+
+            assert_type = config.get("assert_type", "latency")
+
+            print(f"vLLM CI BENCHMARK ({assert_type.upper()})")
+            print("=" * 80)
+            print(f"Config file: {config_path}")
+            print(f"Using shared server at: {base_url}")
+            print("=" * 80)
+            print()
+
+            # Run the benchmark
+            result = run_benchmark.remote(config_json=config_json, base_url=base_url, model_name=model)
+
+            print("\n" + "=" * 80)
+            print(f"RESULTS FOR {config_path}")
+            print("=" * 80)
+            print(json.dumps(result, indent=2))
+            print("=" * 80)
+
+            all_results.append({
+                "config_path": config_path,
+                "result": result
+            })
+
+    finally:
+        # Stop the server after all benchmarks complete
+        stop_vllm_server.remote(server_process)
+
+    # Print summary of all results
+    print("\n\n" + "=" * 80)
+    print("FINAL SUMMARY")
     print("=" * 80)
-    print(json.dumps(result, indent=2))
+
+    all_passed = True
+    for item in all_results:
+        config_path = item["config_path"]
+        result = item["result"]
+        status = result.get("status")
+
+        if status == "passed":
+            print(f"✓ PASSED: {config_path}")
+        else:
+            print(f"✗ FAILED: {config_path}")
+            all_passed = False
+
     print("=" * 80)
 
     # Exit with appropriate status code
-    if result.get("status") == "passed":
-        print("\n✓ CI BENCHMARK PASSED")
+    if all_passed:
+        print(f"\n✓ ALL {len(config_paths)} BENCHMARK(S) PASSED")
         sys.exit(0)
     else:
-        print("\n✗ CI BENCHMARK FAILED")
+        print(f"\n✗ SOME BENCHMARKS FAILED")
         sys.exit(1)

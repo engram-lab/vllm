@@ -41,12 +41,8 @@ jobs:
       - name: Run latency benchmark without adapters
         run: |
           modal run .github/scripts/modal_ci_benchmark.py \
-            --config-path .github/benchmark_configs/base_latency.json
-
-      - name: Run latency benchmark with prefix adapter
-        run: |
-          modal run .github/scripts/modal_ci_benchmark.py \
-            --config-path .github/benchmark_configs/prefix_latency.json
+            --config-paths .github/benchmark_configs/base_latency.json \
+            --config-paths .github/benchmark_configs/prefix_latency.json
 
       - name: Report results
         if: always()
