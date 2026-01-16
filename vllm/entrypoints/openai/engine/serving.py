@@ -265,13 +265,21 @@ class OpenAIServing:
         self.io_processor = self.models.io_processor
         self.model_config = self.models.model_config
         self.max_model_len = self.model_config.max_model_len
+        # Track cartridges that have already sent KV to engine core.
+        self._sent_cartridge_ids: set[str] = set()
 
     def _process_adapters(
         self,
         adapters_config: dict[str, Any] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
-    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, LoRARequest | None]:
+    ) -> tuple[
+        list[int],
+        list["torch.Tensor"] | None,
+        str | None,
+        int | None,
+        LoRARequest | None,
+    ]:
         """
         Process all adapters (prefix, lora) from the request.
 
@@ -291,31 +299,33 @@ class OpenAIServing:
             - LoRARequest object if LoRA adapters specified, or None
         """
         if not adapters_config:
-            return prompt_token_ids, None, None, None
-        
+            return prompt_token_ids, None, None, None, None
+
         # Process prefix adapters (cartridges)
         prefix_specs = adapters_config.get("prefix")
-        prompt_token_ids, prefix_kv, prefix_id = self._process_cartridges(
-            cartridges=prefix_specs,
-            prompt_token_ids=prompt_token_ids,
-            request_id=request_id,
+        prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len = (
+            self._process_cartridges(
+                cartridges=prefix_specs,
+                prompt_token_ids=prompt_token_ids,
+                request_id=request_id,
+            )
         )
-        
+
         # Process LoRA adapters
         lora_specs = adapters_config.get("lora")
         lora_request = self._process_lora(
             lora_specs=lora_specs,
             request_id=request_id,
         )
-        
-        return prompt_token_ids, prefix_kv, prefix_id, lora_request
+
+        return prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, lora_request
 
     def _process_cartridges(
         self,
         cartridges: list[dict[str, Any]] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
-    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None]:
+    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, int | None]:
         """
         Load cartridges and process them for the request.
 
@@ -336,9 +346,9 @@ class OpenAIServing:
             - Cartridge ID for deduplication, or None if no learned cartridge
         """
         import torch
-        
+
         if not cartridges:
-            return prompt_token_ids, None, None
+            return prompt_token_ids, None, None, None
 
         from vllm.logger import init_logger
         from vllm.v1.cartridge_loader import (
@@ -355,22 +365,26 @@ class OpenAIServing:
             learned_cartridges = []
             learned_cartridge_ids = []
             precomputed_cartridges = []
-            
+
             for i, cartridge_data in enumerate(loaded_cartridges):
                 if cartridge_data.is_learned:
                     learned_cartridges.append(cartridge_data)
                     # Get cartridge ID from original spec
-                    learned_cartridge_ids.append(cartridges[i].get("id", f"unknown_{i}"))
+                    learned_cartridge_ids.append(
+                        cartridges[i].get("id", f"unknown_{i}")
+                    )
                 elif cartridge_data.has_valid_token_ids():
                     precomputed_cartridges.append(cartridge_data)
                 else:
                     logger.warning(
-                        f"Skipping cartridge with no valid token_ids and not marked as learned"
+                        "Skipping cartridge with no valid token_ids "
+                        "and not marked as learned"
                     )
-            
+
             # Handle learned cartridges - get stacked tensors for IPC (cached)
             stacked_cartridge_kv: list[torch.Tensor] | None = None
             cartridge_id: str | None = None
+            cartridge_seq_len: int | None = None
             if learned_cartridges:
                 # Currently only supports one learned cartridge per request
                 if len(learned_cartridges) > 1:
@@ -378,14 +392,23 @@ class OpenAIServing:
                         "Multiple learned cartridges detected. "
                         "Only the first one will be used."
                     )
-                
+
                 cartridge_data = learned_cartridges[0]
                 cartridge_id = learned_cartridge_ids[0]
-                
-                # Get stacked KV tensors (computed once, then cached)
-                stacked_cartridge_kv = cartridge_data.get_stacked_kv()
-                
-                # Validate cartridge is compatible with this model (before sending to workers)
+                cartridge_seq_len = cartridge_data.num_tokens
+                assert cartridge_id is not None  # Guaranteed by learned_cartridge_ids
+
+                # Get stacked KV tensors (computed once, then cached).
+                # Only send KV once per cartridge to avoid repeated IPC overhead.
+                if cartridge_id in self._sent_cartridge_ids:
+                    stacked_cartridge_kv = None
+                else:
+                    stacked_cartridge_kv = cartridge_data.get_stacked_kv()
+                    if stacked_cartridge_kv is not None:
+                        self._sent_cartridge_ids.add(cartridge_id)
+
+                # Validate cartridge is compatible with this model
+                # (before sending to workers)
                 if stacked_cartridge_kv is not None:
                     stacked_keys = stacked_cartridge_kv[0]
                     _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
@@ -393,17 +416,21 @@ class OpenAIServing:
                     expected_head_size = self.model_config.get_head_size()
                     if cart_kv_heads != expected_kv_heads:
                         raise ValueError(
-                            f"Cartridge incompatible with model {self.model_config.model}: "
-                            f"cartridge has {cart_kv_heads} KV heads but model expects {expected_kv_heads}. "
-                            f"The cartridge may have been trained on a different model."
+                            f"Cartridge incompatible with model "
+                            f"{self.model_config.model}: cartridge has "
+                            f"{cart_kv_heads} KV heads but model expects "
+                            f"{expected_kv_heads}. The cartridge may have "
+                            f"been trained on a different model."
                         )
                     if cart_head_dim != expected_head_size:
                         raise ValueError(
-                            f"Cartridge incompatible with model {self.model_config.model}: "
-                            f"cartridge has head_dim={cart_head_dim} but model expects {expected_head_size}. "
-                            f"The cartridge may have been trained on a different model."
+                            f"Cartridge incompatible with model "
+                            f"{self.model_config.model}: cartridge has "
+                            f"head_dim={cart_head_dim} but model expects "
+                            f"{expected_head_size}. The cartridge may have "
+                            f"been trained on a different model."
                         )
-                
+
             # Handle pre-computed cartridges (token prepending for prefix caching)
             cartridge_token_ids = []
             for cartridge_data in precomputed_cartridges:
@@ -411,15 +438,26 @@ class OpenAIServing:
 
             if cartridge_token_ids:
                 logger.info(
-                    f"Prepending {len(cartridge_token_ids)} tokens from "
-                    f"{len(precomputed_cartridges)} pre-computed cartridge(s) to prompt"
+                    "Prepending %d tokens from %d pre-computed cartridge(s) to prompt",
+                    len(cartridge_token_ids),
+                    len(precomputed_cartridges),
                 )
-                return cartridge_token_ids + prompt_token_ids, stacked_cartridge_kv, cartridge_id
+                return (
+                    cartridge_token_ids + prompt_token_ids,
+                    stacked_cartridge_kv,
+                    cartridge_id,
+                    cartridge_seq_len,
+                )
             else:
-                return prompt_token_ids, stacked_cartridge_kv, cartridge_id
+                return (
+                    prompt_token_ids,
+                    stacked_cartridge_kv,
+                    cartridge_id,
+                    cartridge_seq_len,
+                )
 
         except Exception as e:
-            logger.error(f"Failed to process cartridges: {e}")
+            logger.error("Failed to process cartridges: %s", e)
             raise RuntimeError(f"Failed to process cartridges: {e}") from e
 
     def _process_lora(
@@ -449,26 +487,30 @@ class OpenAIServing:
             # Only support one LoRA adapter per request
             if len(lora_specs) > 1:
                 logger.warning(
-                    f"Multiple LoRA adapters detected ({len(lora_specs)}). "
-                    "Only the first one will be used."
+                    "Multiple LoRA adapters detected (%d). "
+                    "Only the first one will be used.",
+                    len(lora_specs),
                 )
 
             lora_spec = lora_specs[0]
             lora_id = lora_spec.get("id")
-            lora_source = lora_spec.get("source", "s3")
+            # lora_source is available but not yet used for different backends
+            _ = lora_spec.get("source", "s3")
             force_redownload = lora_spec.get("force_redownload", False)
 
             if not lora_id:
                 logger.error("LoRA adapter spec missing 'id' field")
                 return None
 
-            # Download/load the LoRA adapter directory (contains adapter_model.pt + adapter_config.json)
+            # Download/load the LoRA adapter directory
+            # (contains adapter_model.pt + adapter_config.json)
             manager = get_adapter_manager()
-            
-            import tempfile
+
             import hashlib
-            from pathlib import Path
             import os
+            import tempfile
+            from pathlib import Path
+
             import vllm.envs as envs
 
             # Create a unique local path for this LoRA adapter
@@ -477,51 +519,69 @@ class OpenAIServing:
             lora_cache_dir = envs.VLLM_LORA_RESOLVER_CACHE_DIR or tempfile.gettempdir()
             local_lora_dir = Path(lora_cache_dir) / lora_hash
             local_lora_dir.mkdir(parents=True, exist_ok=True)
-            logger.info(f"LoRA adapter storage directory: {local_lora_dir}")
-            
-            # Download model.pt and lora_config.json from S3, save as adapter_model.pt and adapter_config.json (vLLM format)
+            logger.info("LoRA adapter storage directory: %s", local_lora_dir)
+
+            # Download model.pt and lora_config.json from S3,
+            # save as adapter_model.pt and adapter_config.json (vLLM format)
             adapter_model_path = local_lora_dir / "adapter_model.pt"
             adapter_config_path = local_lora_dir / "adapter_config.json"
-            
+
             if not adapter_model_path.exists() or force_redownload:
                 # lora_id should be a directory path (e.g., s3://bucket/path/to/checkpoint)
                 # We need to download model.pt from that directory (S3 naming)
-                
+
                 # Download model.pt from S3, save as adapter_model.pt locally
-                adapter_model_id = os.path.join(lora_id, "model.pt") if not lora_id.endswith(".pt") else lora_id
-                
+                adapter_model_id = (
+                    os.path.join(lora_id, "model.pt")
+                    if not lora_id.endswith(".pt")
+                    else lora_id
+                )
+
                 lora_data = manager.get_adapter(
                     adapter_id=adapter_model_id,
                     force_redownload=force_redownload,
                 )
-                
+
                 torch.save(lora_data, adapter_model_path)
-                
-                # Download lora_config.json from S3, save as adapter_config.json locally (vLLM format)
-                # If lora_id ends with .pt, use its directory; otherwise use lora_id as-is
-                lora_dir = os.path.dirname(lora_id) if lora_id.endswith(".pt") else lora_id
+
+                # Download lora_config.json from S3,
+                # save as adapter_config.json locally (vLLM format)
+                # If lora_id ends with .pt, use its directory;
+                # otherwise use lora_id as-is
+                lora_dir = (
+                    os.path.dirname(lora_id) if lora_id.endswith(".pt") else lora_id
+                )
                 adapter_config_id = os.path.join(lora_dir, "lora_config.json")
-                
+
                 try:
                     manager.download_json(
                         json_id=adapter_config_id,
                         target_path=adapter_config_path,
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to download lora_config.json: {e}. vLLM may fail to load LoRA.")
+                    logger.warning(
+                        "Failed to download lora_config.json: %s. "
+                        "vLLM may fail to load LoRA.",
+                        e,
+                    )
 
             # Verify files exist before creating LoRARequest
             if not adapter_model_path.exists():
-                raise FileNotFoundError(f"adapter_model.pt not found at {adapter_model_path}")
+                raise FileNotFoundError(
+                    f"adapter_model.pt not found at {adapter_model_path}"
+                )
             if not adapter_config_path.exists():
-                logger.warning(f"adapter_config.json not found at {adapter_config_path}, vLLM may fail to load LoRA")
+                logger.warning(
+                    "adapter_config.json not found at %s, vLLM may fail to load LoRA",
+                    adapter_config_path,
+                )
 
             # Create LoRARequest
             # Generate a stable int ID based on lora_id only (not request_id)
             # This ensures the same LoRA gets the same ID across all requests,
             # allowing vLLM to reuse the loaded LoRA instead of reloading it
             lora_int_id = hash(lora_id) & 0x7FFFFFFF  # Positive int
-            
+
             lora_request = LoRARequest(
                 lora_name=lora_id,  # Use full lora_id for better traceability
                 lora_int_id=lora_int_id,
@@ -531,7 +591,7 @@ class OpenAIServing:
             return lora_request
 
         except Exception as e:
-            logger.error(f"Failed to process LoRA adapters: {e}")
+            logger.error("Failed to process LoRA adapters: %s", e)
             raise RuntimeError(f"Failed to process LoRA adapters: {e}") from e
 
     def _get_tool_parser(
@@ -1570,6 +1630,7 @@ class OpenAIServing:
         priority: int,
         cartridge_kv: list[torch.Tensor] | None = None,
         cartridge_id: str | None = None,
+        cartridge_seq_len: int | None = None,
         data_parallel_rank: int | None = None,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
         """Use the Processor to process inputs for AsyncLLM."""
@@ -1588,6 +1649,7 @@ class OpenAIServing:
             priority=priority,
             cartridge_kv=cartridge_kv,
             cartridge_id=cartridge_id,
+            cartridge_seq_len=cartridge_seq_len,
             data_parallel_rank=data_parallel_rank,
         )
         return engine_request, tokenization_kwargs

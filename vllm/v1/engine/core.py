@@ -14,6 +14,7 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -101,6 +102,8 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        # Cache learned cartridge KV on the engine core to avoid repeated IPC.
+        self._cartridge_kv_cache: dict[str, list[torch.Tensor]] = {}
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -623,7 +626,12 @@ class EngineCore:
                 request.mm_features
             )
 
+        if request.cartridge_id and request.cartridge_kv is not None:
+            self._cartridge_kv_cache[request.cartridge_id] = request.cartridge_kv
+
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        if req.cartridge_kv is None and req.cartridge_id in self._cartridge_kv_cache:
+            req.cartridge_kv = self._cartridge_kv_cache[req.cartridge_id]
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For
@@ -1053,7 +1061,7 @@ class EngineCoreProc(EngineCore):
 
     def _send_engine_dead(self, exception: Exception | None = None):
         """Send EngineDead status to the EngineCoreClient.
-        
+
         Args:
             exception: The exception that caused the engine to die. If provided,
                       the error message will be propagated to the client.
@@ -1062,10 +1070,14 @@ class EngineCoreProc(EngineCore):
         if exception is not None:
             # Format: ENGINE_CORE_DEAD:<error_message>
             error_msg = f"{type(exception).__name__}: {exception}"
-            dead_signal = EngineCoreProc.ENGINE_CORE_DEAD + b":" + error_msg.encode("utf-8", errors="replace")
+            dead_signal = (
+                EngineCoreProc.ENGINE_CORE_DEAD
+                + b":"
+                + error_msg.encode("utf-8", errors="replace")
+            )
         else:
             dead_signal = EngineCoreProc.ENGINE_CORE_DEAD
-        
+
         # Put ENGINE_CORE_DEAD in the queue.
         self.output_queue.put_nowait(dead_signal)
 
@@ -1198,7 +1210,9 @@ class EngineCoreProc(EngineCore):
             while True:
                 output = self.output_queue.get()
                 # Check for ENGINE_CORE_DEAD (may include error message after ":")
-                if isinstance(output, bytes) and output.startswith(EngineCoreProc.ENGINE_CORE_DEAD):
+                if isinstance(output, bytes) and output.startswith(
+                    EngineCoreProc.ENGINE_CORE_DEAD
+                ):
                     for socket in sockets:
                         socket.send(output)
                     break
