@@ -111,15 +111,17 @@ class Request:
         self.num_encoder_inputs = len(self.mm_features)
         self.has_encoder_inputs = self.num_encoder_inputs > 0
 
-        # Cartridge KV for learned cartridge injection
-        # Format: [stacked_keys, stacked_values] where each is (num_layers, num_heads, seq_len, head_dim)
+        # Cartridge KV for learned cartridge injection.
+        # Format: [stacked_keys, stacked_values] where each is
+        # (num_layers, num_heads, seq_len, head_dim)
         self.cartridge_kv = cartridge_kv
         # Cartridge identifier for deduplication across IPC
         self.cartridge_id = cartridge_id
 
         # Track cartridge sequence length (occupies cache positions 0 to cart_seq_len-1)
         if cartridge_kv is not None:
-            # cartridge_kv is [keys, values] where keys.shape = (num_layers, num_heads, seq_len, head_dim)
+            # cartridge_kv is [keys, values] where keys.shape =
+            # (num_layers, num_heads, seq_len, head_dim)
             self.cartridge_seq_len = cartridge_kv[0].shape[2]
         else:
             self.cartridge_seq_len = cartridge_seq_len or 0

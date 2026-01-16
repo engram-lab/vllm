@@ -21,15 +21,6 @@ from tqdm import tqdm
 
 import vllm.envs as envs
 from vllm.attention.layer import Attention, MLAAttention
-from vllm.v1.attention.backend import (
-    AttentionBackend,
-    AttentionMetadata,
-    MultipleOf,
-)
-from vllm.v1.attention.backends.fa_utils import (
-    is_flash_attn_varlen_func_available,
-    reshape_and_cache_flash,
-)
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -116,6 +107,9 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.fa_utils import (
+    reshape_and_cache_flash,
+)
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
@@ -191,9 +185,11 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 logger = init_logger(__name__)
-_CARTRIDGE_DEBUG_TIMING = os.getenv(
-    "VLLM_CARTRIDGE_DEBUG_TIMING", ""
-).lower() in {"1", "true", "yes"}
+_CARTRIDGE_DEBUG_TIMING = os.getenv("VLLM_CARTRIDGE_DEBUG_TIMING", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -488,10 +484,12 @@ class GPUModelRunner(
         # Maps request_id -> cartridge_seq_len
         self.cartridge_position_offsets: dict[str, int] = {}
         # GPU cache for cartridge KV tensors to avoid repeated CPU->GPU transfers.
-        # Maps cartridge_id -> list of (layer_keys, layer_values) tuples, 
+        # Maps cartridge_id -> list of (layer_keys, layer_values) tuples,
         # already transposed and ready for reshape_and_cache_flash.
         # Each layer tensor has shape (seq_len, num_kv_heads, head_dim).
-        self.gpu_cartridge_cache: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        self.gpu_cartridge_cache: dict[
+            str, list[tuple[torch.Tensor, torch.Tensor]]
+        ] = {}
         # Debug counter for cartridge timing logs.
         self._cartridge_debug_count = 0
         self.comm_stream = torch.cuda.Stream()
@@ -865,10 +863,10 @@ class GPUModelRunner(
         cart_seq_len: int,
     ) -> None:
         """Pre-populate cartridge KV into the KV cache.
-        
+
         This writes the cartridge KV to cache slots 0..cart_seq_len-1 so that
         subsequent tokens can attend to it without special handling in attention.
-        
+
         Args:
             block_ids: The allocated block IDs for this request (tuple of lists,
                        one per KV cache group).
@@ -877,47 +875,53 @@ class GPUModelRunner(
             cart_seq_len: Length of the cartridge sequence.
         """
         block_size = self.cache_config.block_size
-        
+
         # Use first KV cache group's block IDs (most common case)
         block_ids_list = block_ids[0]
-        
+
         # Compute slot mapping for all cartridge positions
         positions = torch.arange(cart_seq_len, device=self.device, dtype=torch.long)
         block_indices = positions // block_size
         block_offsets = positions % block_size
-        
+
         # Map virtual block indices to physical block IDs
-        block_ids_tensor = torch.tensor(block_ids_list, device=self.device, dtype=torch.long)
+        block_ids_tensor = torch.tensor(
+            block_ids_list, device=self.device, dtype=torch.long
+        )
         physical_blocks = block_ids_tensor[block_indices]
-        
+
         # Compute slot indices: slot = physical_block * block_size + offset
         slot_mapping = physical_blocks * block_size + block_offsets
-        
+
         # Get cache dtype string for reshape_and_cache_flash
         kv_cache_dtype_str = self.cache_config.cache_dtype
-        
+
         # Use scale=1.0 for cartridge (skip quantization)
         k_scale = torch.ones(1, device=self.device, dtype=torch.float32)
         v_scale = torch.ones(1, device=self.device, dtype=torch.float32)
-        
+
         # Write cartridge KV to each layer's cache
         num_layers = len(layer_kv_list)
         for layer_idx in range(num_layers):
             if layer_idx >= len(self.kv_caches):
                 break
-                
+
             kv_cache = self.kv_caches[layer_idx]
             key_cache, value_cache = kv_cache.unbind(0)
-            
+
             # Get precomputed layer tensors (already transposed and on GPU)
             layer_keys, layer_values = layer_kv_list[layer_idx]
-            
+
             # Write to cache
             reshape_and_cache_flash(
-                layer_keys, layer_values,
-                key_cache, value_cache,
-                slot_mapping, kv_cache_dtype_str,
-                k_scale, v_scale,
+                layer_keys,
+                layer_values,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                kv_cache_dtype_str,
+                k_scale,
+                v_scale,
             )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
@@ -942,7 +946,7 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
-        
+
         # Clear cartridge position offsets for finished requests.
         for req_id in scheduler_output.finished_req_ids:
             self.cartridge_position_offsets.pop(req_id, None)
@@ -1025,21 +1029,27 @@ class GPUModelRunner(
                 prepopulate_ms = 0.0
                 prepare_ms = 0.0
                 gpu_cache_hit = False
-                cartridge_cache_hit = getattr(new_req_data, "cartridge_cache_hit", False)
+                cartridge_cache_hit = getattr(
+                    new_req_data, "cartridge_cache_hit", False
+                )
                 cart_seq_len = None
                 layer_kv_list = None
-                
-                # Check GPU cache first to avoid repeated CPU->GPU transfers and tensor ops
+
+                # Check GPU cache first to avoid repeated
+                # CPU->GPU transfers and tensor ops
                 if cartridge_id in self.gpu_cartridge_cache:
                     # Use cached layer tensors (already transposed and on GPU)
                     layer_kv_list = self.gpu_cartridge_cache[cartridge_id]
-                    cart_seq_len = layer_kv_list[0][0].shape[0]  # (seq_len, num_kv_heads, head_dim)
+                    cart_seq_len = layer_kv_list[0][0].shape[
+                        0
+                    ]  # (seq_len, num_kv_heads, head_dim)
                     gpu_cache_hit = True
                 elif new_req_data.cartridge_kv is not None:
-                    # First time seeing this cartridge - validate, shard, transpose, and cache
+                    # First time seeing this cartridge:
+                    # validate, shard, transpose, and cache
                     stacked_keys, stacked_values = new_req_data.cartridge_kv
                     prepare_start = time.perf_counter()
-                    
+
                     if _CARTRIDGE_DEBUG_TIMING:
                         logger.info(
                             "[cartridge-prepare] req=%s starting cartridge prep, "
@@ -1049,31 +1059,38 @@ class GPUModelRunner(
                             stacked_keys.device,
                             stacked_keys.dtype,
                         )
-                    
+
                     # Validate cartridge dimensions match model architecture
                     total_kv_heads = self.model_config.get_total_num_kv_heads()
                     expected_head_size = self.model_config.get_head_size()
-                    expected_num_layers = self.model_config.get_num_layers(self.parallel_config)
-                    cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
+                    expected_num_layers = self.model_config.get_num_layers(
+                        self.parallel_config
+                    )
+                    cart_num_layers, cart_kv_heads, cart_seq_len, cart_head_dim = (
+                        stacked_keys.shape
+                    )
                     if cart_num_layers != expected_num_layers:
                         raise ValueError(
-                            f"Cartridge incompatible with model: num_layers={cart_num_layers} "
-                            f"but model expects {expected_num_layers}. "
-                            f"Cartridge may have been trained on a different model."
+                            f"Cartridge incompatible with model: "
+                            f"num_layers={cart_num_layers} but model expects "
+                            f"{expected_num_layers}. Cartridge may have been "
+                            f"trained on a different model."
                         )
                     if cart_kv_heads != total_kv_heads:
                         raise ValueError(
-                            f"Cartridge incompatible with model: num_kv_heads={cart_kv_heads} "
-                            f"but model expects {total_kv_heads}. "
-                            f"Cartridge may have been trained on a different model."
+                            f"Cartridge incompatible with model: "
+                            f"num_kv_heads={cart_kv_heads} but model expects "
+                            f"{total_kv_heads}. Cartridge may have been "
+                            f"trained on a different model."
                         )
                     if cart_head_dim != expected_head_size:
                         raise ValueError(
-                            f"Cartridge incompatible with model: head_dim={cart_head_dim} "
-                            f"but model expects {expected_head_size}. "
-                            f"Cartridge may have been trained on a different model."
+                            f"Cartridge incompatible with model: "
+                            f"head_dim={cart_head_dim} but model expects "
+                            f"{expected_head_size}. Cartridge may have been "
+                            f"trained on a different model."
                         )
-                    
+
                     # Shard cartridge KV for tensor parallelism
                     tp_size = self.parallel_config.tensor_parallel_size
                     if tp_size > 1 and total_kv_heads >= tp_size:
@@ -1081,27 +1098,40 @@ class GPUModelRunner(
                         heads_per_gpu = total_kv_heads // tp_size
                         start_head = tp_rank * heads_per_gpu
                         end_head = start_head + heads_per_gpu
-                        stacked_keys = stacked_keys[:, start_head:end_head, :, :].contiguous()
-                        stacked_values = stacked_values[:, start_head:end_head, :, :].contiguous()
-                    
-                    # Precompute transposed layer tensors and move to GPU once
-                    # This avoids repeated transpose().contiguous().to() calls per request
+                        stacked_keys = stacked_keys[
+                            :, start_head:end_head, :, :
+                        ].contiguous()
+                        stacked_values = stacked_values[
+                            :, start_head:end_head, :, :
+                        ].contiguous()
+
+                    # Precompute transposed layer tensors and move to GPU once.
+                    # This avoids repeated transpose().contiguous().to() calls.
                     layer_kv_list = []
                     transpose_start = time.perf_counter()
                     for layer_idx in range(cart_num_layers):
-                        # (num_kv_heads, seq_len, head_dim) -> (seq_len, num_kv_heads, head_dim)
-                        layer_keys = stacked_keys[layer_idx].transpose(0, 1).contiguous()
-                        layer_values = stacked_values[layer_idx].transpose(0, 1).contiguous()
+                        # (num_kv_heads, seq_len, head_dim) ->
+                        # (seq_len, num_kv_heads, head_dim)
+                        layer_keys = (
+                            stacked_keys[layer_idx].transpose(0, 1).contiguous()
+                        )
+                        layer_values = (
+                            stacked_values[layer_idx].transpose(0, 1).contiguous()
+                        )
                         # Transfer to GPU and convert dtype
-                        layer_keys = layer_keys.to(self.device, dtype=self.kv_cache_dtype)
-                        layer_values = layer_values.to(self.device, dtype=self.kv_cache_dtype)
+                        layer_keys = layer_keys.to(
+                            self.device, dtype=self.kv_cache_dtype
+                        )
+                        layer_values = layer_values.to(
+                            self.device, dtype=self.kv_cache_dtype
+                        )
                         layer_kv_list.append((layer_keys, layer_values))
                     transpose_ms = (time.perf_counter() - transpose_start) * 1000.0
-                    
+
                     # Cache the precomputed layer tensors
                     self.gpu_cartridge_cache[cartridge_id] = layer_kv_list
                     prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
-                    
+
                     if _CARTRIDGE_DEBUG_TIMING:
                         logger.info(
                             "[cartridge-prepare] req=%s transpose_and_transfer_ms=%.2f "
@@ -1114,28 +1144,29 @@ class GPUModelRunner(
                 else:
                     # No GPU cache and no KV payload; fall back to provided seq_len.
                     cart_seq_len = getattr(new_req_data, "cartridge_seq_len", 0)
-                
+
                 if not cartridge_cache_hit:
                     if layer_kv_list is None:
                         # We need KV tensors to prepopulate on cache miss.
                         raise RuntimeError(
-                            f"Cartridge {cartridge_id} KV not available for prepopulate "
-                            f"(cache_hit={cartridge_cache_hit})."
+                            f"Cartridge {cartridge_id} KV not available for "
+                            f"prepopulate (cache_hit={cartridge_cache_hit})."
                         )
                     prepopulate_start = time.perf_counter()
                     self._prepopulate_cartridge_to_cache(
                         new_req_data.block_ids, layer_kv_list, cart_seq_len
                     )
                     prepopulate_ms = (time.perf_counter() - prepopulate_start) * 1000.0
-                
-                # Store position offset - input tokens need positions/slots offset by cart_seq_len
+
+                # Store position offset:
+                # input tokens need positions/slots offset by cart_seq_len
                 self.cartridge_position_offsets[req_id] = cart_seq_len
 
                 if _CARTRIDGE_DEBUG_TIMING:
                     self._cartridge_debug_count += 1
                     logger.info(
-                        "[cartridge] req=%s seq_len=%d gpu_cache_hit=%s prefix_cache_hit=%s "
-                        "prepare_ms=%.2f prepopulate_ms=%.2f",
+                        "[cartridge] req=%s seq_len=%d gpu_cache_hit=%s "
+                        "prefix_cache_hit=%s prepare_ms=%.2f prepopulate_ms=%.2f",
                         req_id,
                         cart_seq_len,
                         gpu_cache_hit,
@@ -1687,7 +1718,7 @@ class GPUModelRunner(
                 n_tokens = num_scheduled_tokens[req_idx]
                 if req_id in self.cartridge_position_offsets:
                     offset = self.cartridge_position_offsets[req_id]
-                    positions_np[token_idx:token_idx + n_tokens] += offset
+                    positions_np[token_idx : token_idx + n_tokens] += offset
                 token_idx += n_tokens
 
         self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
@@ -1705,7 +1736,8 @@ class GPUModelRunner(
         self.seq_lens.np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
         )
-        # Add cartridge lengths to seq_lens so attention covers cartridge + input tokens.
+        # Add cartridge lengths to seq_lens so attention covers
+        # cartridge + input tokens.
         if self.cartridge_position_offsets:
             for req_idx in range(num_reqs):
                 req_id = self.input_batch.req_ids[req_idx]
@@ -3435,9 +3467,7 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
-            prepare_inputs_ms = (
-                time.perf_counter() - prepare_inputs_start
-            ) * 1000.0
+            prepare_inputs_ms = (time.perf_counter() - prepare_inputs_start) * 1000.0
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -3585,9 +3615,7 @@ class GPUModelRunner(
                             time.perf_counter() - postprocess_start
                         ) * 1000.0
                         max_seq_len = (
-                            int(self.seq_lens.np[:num_reqs].max())
-                            if num_reqs
-                            else 0
+                            int(self.seq_lens.np[:num_reqs].max()) if num_reqs else 0
                         )
                         logger.info(
                             "[cartridge-step] num_reqs=%d tokens=%d max_query_len=%d "
@@ -3618,9 +3646,7 @@ class GPUModelRunner(
                             time.perf_counter() - postprocess_start
                         ) * 1000.0
                         max_seq_len = (
-                            int(self.seq_lens.np[:num_reqs].max())
-                            if num_reqs
-                            else 0
+                            int(self.seq_lens.np[:num_reqs].max()) if num_reqs else 0
                         )
                         logger.info(
                             "[cartridge-step] num_reqs=%d tokens=%d max_query_len=%d "
@@ -3641,9 +3667,7 @@ class GPUModelRunner(
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
                 if _CARTRIDGE_DEBUG_TIMING and step_has_cartridge:
-                    postprocess_ms = (
-                        time.perf_counter() - postprocess_start
-                    ) * 1000.0
+                    postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
                     max_seq_len = (
                         int(self.seq_lens.np[:num_reqs].max()) if num_reqs else 0
                     )
@@ -3691,9 +3715,7 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
                 if _CARTRIDGE_DEBUG_TIMING and step_has_cartridge:
-                    postprocess_ms = (
-                        time.perf_counter() - postprocess_start
-                    ) * 1000.0
+                    postprocess_ms = (time.perf_counter() - postprocess_start) * 1000.0
                     max_seq_len = (
                         int(self.seq_lens.np[:num_reqs].max()) if num_reqs else 0
                     )

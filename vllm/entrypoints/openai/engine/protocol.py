@@ -119,6 +119,7 @@ class OpenAIBaseModel(BaseModel):
 
 class ErrorDebugInfo(OpenAIBaseModel):
     """Debug info included when VLLM_PASSTHROUGH_ERRORS is enabled."""
+
     request_id: str | None = None
     stack_trace: str | None = None
     # Request metadata (not full prompts/completions for security)
@@ -535,7 +536,9 @@ class AdapterSpec(OpenAIBaseModel):
     )
     source: Literal["s3", "local"] = Field(
         default="s3",
-        description=("The source type of the adapter. Supports: s3, local, wandb, huggingface"),
+        description=(
+            "The source type of the adapter. Supports: s3, local, wandb, huggingface"
+        ),
     )
     force_redownload: bool = Field(
         default=False,
@@ -548,7 +551,7 @@ class AdapterSpec(OpenAIBaseModel):
 
 class AdaptersConfig(OpenAIBaseModel):
     """Configuration for multiple adapter types in a request."""
-    
+
     prefix: list[AdapterSpec] | None = Field(
         default=None,
         description="List of prefix/cartridge adapters to load (learned KV cache)",
@@ -557,6 +560,7 @@ class AdaptersConfig(OpenAIBaseModel):
         default=None,
         description="List of LoRA adapters to load (low-rank weight deltas)",
     )
+
 
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
@@ -692,7 +696,7 @@ class CompletionRequest(OpenAIBaseModel):
             "and LoRA adapters that can be loaded from S3, local storage, etc."
         ),
     )
-    
+
     vllm_xargs: dict[str, str | int | float] | None = Field(
         default=None,
         description=(

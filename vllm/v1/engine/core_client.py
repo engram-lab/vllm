@@ -429,10 +429,13 @@ class BackgroundResources:
             frame_data = bytes(frames[0].buffer)
             if frame_data.startswith(EngineCoreProc.ENGINE_CORE_DEAD):
                 self.engine_dead = True
-                # Parse error message if present (format: ENGINE_CORE_DEAD:error_message)
+                # Parse error message if present
+                # (format: ENGINE_CORE_DEAD:error_message)
                 error_msg = None
                 if b":" in frame_data:
-                    error_msg = frame_data.split(b":", 1)[1].decode("utf-8", errors="replace")
+                    error_msg = frame_data.split(b":", 1)[1].decode(
+                        "utf-8", errors="replace"
+                    )
                     # Store the error for later use
                     self.engine_dead_error = error_msg
                 raise EngineDeadError(error_msg)

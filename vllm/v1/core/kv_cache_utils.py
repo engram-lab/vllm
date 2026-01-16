@@ -511,15 +511,16 @@ def generate_block_hash_extra_keys(
     # Include cartridge_id in ALL blocks (not just first) because cartridge
     # shifts RoPE positions for all tokens. Requests with the same cartridge
     # can share prefix cache; different cartridges will have different hashes.
-    cartridge_keys: list[str] = (
-        [request.cartridge_id] if request.cartridge_id else []
-    )
+    cartridge_keys: list[str] = [request.cartridge_id] if request.cartridge_id else []
     prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
 
     extra_keys: list[Any] = (
-        lora_extra_keys + mm_extra_keys + cache_salt_keys + cartridge_keys
+        lora_extra_keys
+        + mm_extra_keys
+        + cache_salt_keys
+        + cartridge_keys
         + prompt_embeds_keys
     )
 
@@ -565,7 +566,7 @@ def _generate_cartridge_virtual_tokens(
     hash_fn,
 ) -> list[int]:
     """Generate deterministic virtual token IDs for cartridge prefix sharing."""
-    base_hash = int.from_bytes(hash_fn(cartridge_id)[:4], 'big')
+    base_hash = int.from_bytes(hash_fn(cartridge_id)[:4], "big")
     return [-(base_hash + i) for i in range(seq_len)]
 
 
@@ -579,9 +580,9 @@ def get_request_block_hasher(
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
         # For cartridge requests, prepend virtual tokens for shared prefix caching.
-        cart_seq_len = getattr(request, 'cartridge_seq_len', 0)
-        cart_id = getattr(request, 'cartridge_id', None)
-        
+        cart_seq_len = getattr(request, "cartridge_seq_len", 0)
+        cart_id = getattr(request, "cartridge_id", None)
+
         if cart_seq_len > 0 and cart_id:
             virtual_tokens = _generate_cartridge_virtual_tokens(
                 cart_id, cart_seq_len, caching_hash_fn
@@ -589,7 +590,7 @@ def get_request_block_hasher(
             hash_token_ids = virtual_tokens + list(request.all_token_ids)
         else:
             hash_token_ids = list(request.all_token_ids)
-        
+
         total_tokens = request.num_tokens + cart_seq_len
         start_token_idx = len(request.block_hashes) * block_size
 

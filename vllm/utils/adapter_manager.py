@@ -17,7 +17,6 @@ import os
 import threading
 import time
 from pathlib import Path as StdPath
-from typing import Optional
 
 import filelock
 import torch
@@ -36,14 +35,14 @@ class AdapterManager:
     - Loading adapters from local file paths
     - Caching downloaded files to avoid re-downloading
     - Thread-safe file locking during downloads
-    
+
     Supports multiple adapter types:
     - KV cache cartridges (prefix adapters)
     - LoRA adapter weights
     - Any other trained model artifacts
     """
 
-    def __init__(self, cache_dir: Optional[str] = None):
+    def __init__(self, cache_dir: str | None = None):
         """
         Initialize the AdapterManager.
 
@@ -58,7 +57,9 @@ class AdapterManager:
 
         self.cache_dir = StdPath(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"AdapterManager initialized with cache_dir: {self.cache_dir}")
+        logger.info(
+            "AdapterManager initialized with cache_dir: %s", self.cache_dir
+        )
 
     def _get_cache_path(self, uri: str) -> StdPath:
         """
@@ -90,7 +91,8 @@ class AdapterManager:
 
         Args:
             adapter_id: The identifier/path of the adapter (S3 URI or local path)
-            force_redownload: If True, re-download even if cached (only applies to remote files)
+            force_redownload: If True, re-download even if cached
+                (only applies to remote files)
 
         Returns:
             Loaded adapter tensor data
@@ -100,7 +102,7 @@ class AdapterManager:
             RuntimeError: If download or loading fails
         """
         source_path = Path(adapter_id)
-        
+
         # For remote paths (S3), use caching
         if adapter_id.startswith("s3://"):
             cache_path = self._get_cache_path(adapter_id)
@@ -109,15 +111,20 @@ class AdapterManager:
             def _copy_with_progress(*, reason: str) -> None:
                 """Copy adapter from source_path to cache_path with progress logging.
 
-                NOTE: Path.copy doesn't expose callbacks, so we poll the destination size.
-                boto3's download_file writes to a temp file (*.XXXXXX) then renames atomically.
+                NOTE: Path.copy doesn't expose callbacks, so we poll
+                the destination size. boto3's download_file writes to a
+                temp file (*.XXXXXX) then renames atomically.
                 """
                 import glob as globlib
+
                 start_t = time.time()
                 stop_evt = threading.Event()
 
                 def _get_download_size() -> int:
-                    """Get size of download in progress (checks both final and temp files)."""
+                    """Get size of download in progress.
+
+                    Checks both final and temp files.
+                    """
                     # Check final destination first
                     if cache_path.exists():
                         return cache_path.stat().st_size
@@ -138,9 +145,14 @@ class AdapterManager:
                             now = time.time()
                             if size != last_size:
                                 last_change_t = now
-                                delta_mb = (size - last_size) / (1024 * 1024) if last_size >= 0 else 0.0
+                                delta_mb = (
+                                    (size - last_size) / (1024 * 1024)
+                                    if last_size >= 0
+                                    else 0.0
+                                )
                                 logger.info(
-                                    "Adapter download progress (%s): %.2f MB (Δ%.2f MB) -> %s",
+                                    "Adapter download progress (%s): "
+                                    "%.2f MB (Δ%.2f MB) -> %s",
                                     reason,
                                     size / (1024 * 1024),
                                     delta_mb,
@@ -148,10 +160,11 @@ class AdapterManager:
                                 )
                                 last_size = size
                             elif now - last_change_t > 120:
-                                # If nothing changes for a while, still emit a heartbeat so it
-                                # doesn't look like a hang.
+                                # If nothing changes for a while,
+                                # still emit a heartbeat so it doesn't look like a hang.
                                 logger.info(
-                                    "Adapter download still in progress (%s): %.2f MB written to %s (no size change for %.0fs)",
+                                    "Adapter download still in progress (%s): "
+                                    "%.2f MB written to %s (no change for %.0fs)",
                                     reason,
                                     size / (1024 * 1024),
                                     cache_path,
@@ -180,11 +193,12 @@ class AdapterManager:
             def _cleanup_temp_files() -> None:
                 """Remove stale boto3 temp files from previous interrupted downloads."""
                 import glob as globlib
+
                 temp_pattern = str(cache_path) + ".*"
                 for temp_file in globlib.glob(temp_pattern):
                     try:
                         StdPath(temp_file).unlink()
-                        logger.info(f"Cleaned up stale temp file: {temp_file}")
+                        logger.info("Cleaned up stale temp file: %s", temp_file)
                     except Exception:
                         pass
 
@@ -196,7 +210,7 @@ class AdapterManager:
                 if should_download:
                     # Clean up any stale temp files from previous interrupted downloads
                     _cleanup_temp_files()
-                    logger.info(f"Downloading adapter from {adapter_id}")
+                    logger.info("Downloading adapter from %s", adapter_id)
                     try:
                         _copy_with_progress(reason="initial")
                     except Exception as e:
@@ -204,9 +218,11 @@ class AdapterManager:
                         _cleanup_temp_files()
                         if cache_path.exists():
                             cache_path.unlink()
-                        raise RuntimeError(f"Failed to download adapter from {adapter_id}: {e}") from e
+                        raise RuntimeError(
+                            f"Failed to download adapter from {adapter_id}: {e}"
+                        ) from e
                 else:
-                    logger.info(f"Using cached adapter: {cache_path}")
+                    logger.info("Using cached adapter: %s", cache_path)
 
                 # Load the adapter
                 try:
@@ -226,27 +242,29 @@ class AdapterManager:
                             return data
                         except Exception as retry_e:
                             _cleanup_temp_files()
-                            raise RuntimeError(f"Failed to load adapter even after retry: {retry_e}") from retry_e
+                            raise RuntimeError(
+                                f"Failed to load adapter even after retry: {retry_e}"
+                            ) from retry_e
                     raise RuntimeError(f"Failed to load adapter: {e}") from e
-        
+
         # For local paths, load directly
         else:
             if not source_path.exists():
                 raise FileNotFoundError(f"Local adapter not found: {adapter_id}")
 
-            logger.info(f"Loading adapter from local path: {adapter_id}")
+            logger.info("Loading adapter from local path: %s", adapter_id)
             try:
                 # For local paths, we can use the path directly as it's file-like
                 data = torch.load(str(source_path), map_location="cpu")
                 return data
             except Exception as e:
-                logger.error(f"Failed to load local adapter: {e}")
+                logger.error("Failed to load local adapter: %s", e)
                 raise
 
     def download_json(
         self,
         json_id: str,
-        target_path: Optional[StdPath] = None,
+        target_path: StdPath | None = None,
     ) -> dict:
         """
         Download and parse a JSON file from S3 or local path.
@@ -270,7 +288,7 @@ class AdapterManager:
             RuntimeError: If download or parsing fails
         """
         source_path = Path(json_id)
-        
+
         if not source_path.exists():
             raise FileNotFoundError(f"JSON file not found: {json_id}")
 
@@ -279,14 +297,16 @@ class AdapterManager:
             content = source_path.read_text()
             data = json.loads(content)
         except Exception as e:
-            raise RuntimeError(f"Failed to read or parse JSON from {json_id}: {e}") from e
-        
+            raise RuntimeError(
+                f"Failed to read or parse JSON from {json_id}: {e}"
+            ) from e
+
         # Save to target path if provided
         if target_path is not None:
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(target_path, 'w') as f:
+            with open(target_path, "w") as f:
                 json.dump(data, f, indent=2)
-        
+
         return data
 
     def clear_cache(self) -> None:
@@ -300,7 +320,7 @@ class AdapterManager:
 
 
 # Global adapter manager instance
-_global_adapter_manager: Optional[AdapterManager] = None
+_global_adapter_manager: AdapterManager | None = None
 
 
 def get_adapter_manager() -> AdapterManager:
@@ -309,4 +329,3 @@ def get_adapter_manager() -> AdapterManager:
     if _global_adapter_manager is None:
         _global_adapter_manager = AdapterManager()
     return _global_adapter_manager
-

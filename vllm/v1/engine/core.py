@@ -14,6 +14,7 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -102,7 +103,7 @@ class EngineCore:
 
         self.log_stats = log_stats
         # Cache learned cartridge KV on the engine core to avoid repeated IPC.
-        self._cartridge_kv_cache: dict[str, list["torch.Tensor"]] = {}
+        self._cartridge_kv_cache: dict[str, list[torch.Tensor]] = {}
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -1060,7 +1061,7 @@ class EngineCoreProc(EngineCore):
 
     def _send_engine_dead(self, exception: Exception | None = None):
         """Send EngineDead status to the EngineCoreClient.
-        
+
         Args:
             exception: The exception that caused the engine to die. If provided,
                       the error message will be propagated to the client.
@@ -1069,10 +1070,14 @@ class EngineCoreProc(EngineCore):
         if exception is not None:
             # Format: ENGINE_CORE_DEAD:<error_message>
             error_msg = f"{type(exception).__name__}: {exception}"
-            dead_signal = EngineCoreProc.ENGINE_CORE_DEAD + b":" + error_msg.encode("utf-8", errors="replace")
+            dead_signal = (
+                EngineCoreProc.ENGINE_CORE_DEAD
+                + b":"
+                + error_msg.encode("utf-8", errors="replace")
+            )
         else:
             dead_signal = EngineCoreProc.ENGINE_CORE_DEAD
-        
+
         # Put ENGINE_CORE_DEAD in the queue.
         self.output_queue.put_nowait(dead_signal)
 
@@ -1205,7 +1210,9 @@ class EngineCoreProc(EngineCore):
             while True:
                 output = self.output_queue.get()
                 # Check for ENGINE_CORE_DEAD (may include error message after ":")
-                if isinstance(output, bytes) and output.startswith(EngineCoreProc.ENGINE_CORE_DEAD):
+                if isinstance(output, bytes) and output.startswith(
+                    EngineCoreProc.ENGINE_CORE_DEAD
+                ):
                     for socket in sockets:
                         socket.send(output)
                     break

@@ -61,9 +61,11 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
-_CARTRIDGE_DEBUG_TIMING = os.getenv(
-    "VLLM_CARTRIDGE_DEBUG_TIMING", ""
-).lower() in {"1", "true", "yes"}
+_CARTRIDGE_DEBUG_TIMING = os.getenv("VLLM_CARTRIDGE_DEBUG_TIMING", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 class Scheduler(SchedulerInterface):
@@ -541,14 +543,16 @@ class Scheduler(SchedulerInterface):
                             # Enhanced debug: show first few block hashes for debugging
                             first_block_hashes = (
                                 [str(h)[:16] for h in request.block_hashes[:3]]
-                                if request.block_hashes else []
+                                if request.block_hashes
+                                else []
                             )
                             logger.info(
-                                "[cartridge] req=%s cart_id=%s cart_seq_len=%d num_cart_blocks=%d "
-                                "prefix_cache_hit=%s new_computed_tokens=%d "
-                                "computed_blocks_lens=%s num_block_hashes=%d first_hashes=%s",
+                                "[cartridge] req=%s cart_id=%s cart_seq_len=%d "
+                                "num_cart_blocks=%d prefix_cache_hit=%s "
+                                "new_computed_tokens=%d computed_blocks_lens=%s "
+                                "num_block_hashes=%d first_hashes=%s",
                                 request.request_id,
-                                getattr(request, 'cartridge_id', None),
+                                getattr(request, "cartridge_id", None),
                                 cart_seq_len,
                                 num_cart_blocks,
                                 cartridge_cache_hit,
@@ -558,7 +562,8 @@ class Scheduler(SchedulerInterface):
                                 first_block_hashes,
                             )
                     else:
-                        # Non-cartridge requests are excluded from cartridge cache stats.
+                        # Non-cartridge requests are excluded from
+                        # cartridge cache stats.
                         pass
 
                     # Get externally-cached tokens if using a KVConnector.
@@ -608,7 +613,7 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    
+
                     # For cartridge cache MISS, count cart_seq_len in budget
                     # (need to load cartridge). For cache HIT, don't count
                     # (cartridge already in memory, shared via prefix cache).
@@ -622,11 +627,12 @@ class Scheduler(SchedulerInterface):
                         budget_cost = num_new_tokens + cart_seq_len
                     else:
                         budget_cost = num_new_tokens
-                    
+
                     if _CARTRIDGE_DEBUG_TIMING and cart_seq_len > 0:
                         logger.info(
-                            "[cartridge-sched] req=%s cache_hit=%s num_new_tokens=%d "
-                            "budget_cost=%d token_budget=%d num_running=%d num_waiting=%d",
+                            "[cartridge-sched] req=%s cache_hit=%s "
+                            "num_new_tokens=%d budget_cost=%d "
+                            "token_budget=%d num_running=%d num_waiting=%d",
                             request.request_id,
                             cartridge_cache_hit,
                             num_new_tokens,
@@ -635,7 +641,7 @@ class Scheduler(SchedulerInterface):
                             len(self.running),
                             len(self.waiting),
                         )
-                    
+
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
@@ -768,7 +774,10 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= budget_cost
-                if _CARTRIDGE_DEBUG_TIMING and getattr(request, "cartridge_seq_len", 0) > 0:
+                if (
+                    _CARTRIDGE_DEBUG_TIMING
+                    and getattr(request, "cartridge_seq_len", 0) > 0
+                ):
                     logger.info(
                         "[cartridge-sched] SCHEDULED req=%s num_new_tokens=%d "
                         "budget_cost=%d remaining_budget=%d",

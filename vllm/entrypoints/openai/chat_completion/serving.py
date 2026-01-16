@@ -403,7 +403,7 @@ class OpenAIServingChat(OpenAIServing):
                 cartridge_id = None
                 cartridge_seq_len = None
                 dynamic_lora_request = None
-                
+
                 # Convert adapters config to dict if present
                 adapters_dict = None
                 if request.adapters:
@@ -412,7 +412,7 @@ class OpenAIServingChat(OpenAIServing):
                         adapters_dict = request.adapters
                     else:
                         adapters_dict = request.adapters.model_dump()
-                
+
                 # Process all adapters (prefix + lora)
                 if adapters_dict:
                     (
@@ -426,7 +426,7 @@ class OpenAIServingChat(OpenAIServing):
                         prompt_token_ids=engine_prompt["prompt_token_ids"],
                         request_id=sub_request_id,
                     )
-                
+
                 # Override with dynamic LoRA request if created
                 if dynamic_lora_request:
                     lora_request = dynamic_lora_request

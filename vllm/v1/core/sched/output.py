@@ -46,7 +46,8 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
 
     # Learned cartridge KV for injection into attention.
-    # Format: [stacked_keys, stacked_values] where each is (num_layers, num_heads, seq_len, head_dim)
+    # Format: [stacked_keys, stacked_values] where each is
+    # (num_layers, num_heads, seq_len, head_dim)
     cartridge_kv: "list[torch.Tensor] | None" = None
     # Cartridge identifier for deduplication across IPC
     cartridge_id: str | None = None
