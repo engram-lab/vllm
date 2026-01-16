@@ -9,11 +9,6 @@ Runs benchmarks and asserts thresholds based on config:
 Exits with status code 0 if all passed, 1 if any failed.
 
 Usage:
-    # Single config
-    modal run .github/scripts/modal_ci_benchmark.py \
-        --config-paths .github/benchmark_configs/base_latency.json
-
-    # Multiple configs
     modal run .github/scripts/modal_ci_benchmark.py \
         --config-paths .github/benchmark_configs/base_latency.json \
         --config-paths .github/benchmark_configs/base_throughput.json
@@ -258,6 +253,7 @@ def run_benchmarks_with_server(model: str, tensor_parallel_size: int, config_jso
                     "--num-warmups",
                     str(config.get("num_warmups", 5)),
                     "--save-result",
+                    "--disable-cascade-attn",
                 ]
 
                 # Add dataset-specific arguments
