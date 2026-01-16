@@ -4,7 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+<<<<<<< HEAD:.github/workflows/throughput_benchmark.yml
     branches: [main]
+=======
+    types: [ready_for_review, opened, reopened]
+    branches:
+      - main
+>>>>>>> aec605cb7aed2127d3b17226e6a3e988d77244a7:.github/workflows/throughput-benchmark.yml
   workflow_dispatch:  # Allow manual triggering
 
 concurrency:

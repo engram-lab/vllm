@@ -3,6 +3,10 @@ name: Latency Benchmark
 on:
   push:
     branches: [main]
+  pull_request:
+    types: [ready_for_review, opened, reopened]
+    branches:
+      - main
   workflow_dispatch:  # Allow manual triggering
 
 concurrency:
@@ -38,7 +42,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install modal
 
-      - name: Run latency benchmark without adapters
+      - name: Run latency benchmark
         run: |
           modal run .github/scripts/modal_ci_benchmark.py \
             --config-paths .github/benchmark_configs/base_latency.json \
