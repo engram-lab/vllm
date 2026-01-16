@@ -22,9 +22,9 @@ jobs:
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-      GPU_TYPE: "A100"
+      GPU_TYPE: "H200"
       GPU_COUNT: "1"
-      THROUGHPUT_THRESHOLD_TOK_S: "1500.0"
+      THROUGHPUT_THRESHOLD_TOK_S: "2500.0"
 
     steps:
       - name: Checkout code

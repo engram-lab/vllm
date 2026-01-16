@@ -32,7 +32,7 @@ import modal
 # --- Configuration ---
 PORT = 8000
 BRANCH = os.environ.get("BRANCH", "main")
-GPU_TYPE = os.environ.get("GPU_TYPE", "A100")
+GPU_TYPE = os.environ.get("GPU_TYPE", "H200")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", 1))
 SECRETS = os.environ.get("SECRETS", "sabri-api-keys")
 
@@ -43,8 +43,8 @@ MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 
 # Benchmark thresholds (can be overridden by config)
-TPOT_THRESHOLD_MS = float(os.environ.get("TPOT_THRESHOLD_MS", "15.0"))
-THROUGHPUT_THRESHOLD_TOK_S = float(os.environ.get("THROUGHPUT_THRESHOLD_TOK_S", "1500.0"))
+TPOT_THRESHOLD_MS = float(os.environ.get("TPOT_THRESHOLD_MS", "10.0"))
+THROUGHPUT_THRESHOLD_TOK_S = float(os.environ.get("THROUGHPUT_THRESHOLD_TOK_S", "2500.0"))
 
 MINUTES = 60  # seconds
 

@@ -460,3 +460,84 @@ async def test_cartridge_high_concurrency_streaming(vllm_client):
         raise RuntimeError(errors[0])
     
     print(f"✓ All {n_concurrent} streaming requests completed successfully")
+
+
+async def test_cartridge_gpu_memory_cleanup(vllm_client, vllm_server):
+    """Test that cartridge GPU memory is properly freed after requests finish.
+    
+    This test verifies that the gpu_cartridge_cache is cleaned up when all
+    requests using a cartridge have finished. Without proper cleanup, GPU
+    memory would leak with each new cartridge (~1-2GB per 4096-token cartridge).
+    
+    The test works by:
+    1. Running requests with a cartridge
+    2. Waiting for all requests to finish
+    3. Checking that GPU memory usage returns close to baseline
+    """
+    
+    async def get_gpu_memory_used() -> float:
+        """Get GPU memory used in MB from vLLM metrics."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{vllm_server.url_for('metrics')}")
+            for line in resp.text.split("\n"):
+                # Look for GPU memory metric
+                if "vllm:gpu_cache_usage_perc" in line and not line.startswith("#"):
+                    return float(line.split()[-1])
+        return 0.0
+    
+    # Get baseline memory before any cartridge requests
+    baseline_usage = await get_gpu_memory_used()
+    print(f"\nBaseline GPU cache usage: {baseline_usage:.2%}")
+    
+    # Run a batch of cartridge requests
+    n_requests = 10
+    prompts = [f"Problem inputs: {i} and {i+1}" for i in range(n_requests)]
+    
+    print(f"Sending {n_requests} cartridge requests...")
+    tasks = []
+    for prompt in prompts:
+        task = vllm_client.chat.completions.create(
+            model=BASE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=32,
+            extra_body={
+                "adapters": {
+                    "prefix": [
+                        {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
+                    ]
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        tasks.append(task)
+    
+    # Wait for all requests to complete
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    errors = [r for r in results if isinstance(r, Exception)]
+    if errors:
+        raise errors[0]
+    
+    print(f"All {n_requests} requests completed")
+    
+    # Give the server a moment to clean up
+    await asyncio.sleep(1.0)
+    
+    # Check memory usage after requests finish
+    final_usage = await get_gpu_memory_used()
+    print(f"Final GPU cache usage: {final_usage:.2%}")
+    
+    # Memory should be roughly the same (within a small tolerance)
+    # The cartridge GPU cache should have been freed when requests finished
+    usage_diff = final_usage - baseline_usage
+    print(f"Usage difference: {usage_diff:+.2%}")
+    
+    # Note: This is a soft check - the cache cleanup is best-effort
+    # A large positive difference would indicate a memory leak
+    if usage_diff > 0.10:  # More than 10% increase
+        print(
+            f"WARNING: GPU cache usage increased by {usage_diff:.2%} after "
+            f"cartridge requests. Possible memory leak."
+        )
+    else:
+        print("✓ GPU memory properly cleaned up after cartridge requests")

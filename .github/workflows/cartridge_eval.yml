@@ -5,7 +5,9 @@ on:
     branches: [main]
   pull_request:
     paths:
-      - 'vllm/lora/**'
+      - 'vllm/v1/worker/gpu_model_runner.py'
+      - 'vllm/v1/cartridge_loader.py'
+      - 'vllm/v1/core/kv_cache_utils.py'
       - 'tests/test_cartridge_addition_eval.py'
   workflow_dispatch:  # Allow manual triggering
 
@@ -24,7 +26,7 @@ jobs:
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-      GPU_TYPE: "A100"
+      GPU_TYPE: "H200"
       GPU_COUNT: "1"
       BRANCH: ${{ github.head_ref || github.ref_name }}
 
@@ -42,7 +44,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install modal
 
-      - name: Run cartridge addition eval tests
+      - name: Run cartridge evaluation tests
         run: |
           modal run .github/scripts/modal_ci_pytest.py \
             --test-path tests/test_cartridge_addition_eval.py \
@@ -52,5 +54,5 @@ jobs:
       - name: Report results
         if: always()
         run: |
-          echo "Cartridge addition eval completed"
+          echo "Cartridge evaluation completed (includes memory cleanup tests)"
           echo "Check the logs above for results"
