@@ -41,7 +41,8 @@ jobs:
       - name: Run throughput benchmark
         run: |
           modal run .github/scripts/modal_ci_benchmark.py \
-            --config-path .github/benchmark_configs/base_throughput.json
+            --config-paths .github/benchmark_configs/base_throughput.json \
+            --config-paths .github/benchmark_configs/prefix_throughput.json
 
       - name: Report results
         if: always()
