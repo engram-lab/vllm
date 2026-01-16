@@ -1,0 +1,28 @@
+{
+  "name": "ci_latency",
+  "description": "CI benchmark for latency - asserts TPOT < 10ms",
+  "model_name": "Qwen/Qwen3-8B",
+  "dataset_name": "random",
+  "extra_body": {
+    "adapters": {
+      "prefix": [
+        {
+          "id": "s3://engram-cartridges/weights/torchtitan/2026-01-14/07-17-01-qwen3-8b-workspace-sabri-2026-01-14_07-16-56-d20c80e2/step-4800/model.pt",
+          "source": "s3",
+          "force_redownload": false
+        }
+      ]
+    }
+  },
+  "num_prompts": 100,
+  "prompt_len": 512,
+  "output_len": 128,
+  "max_concurrency": 1,
+  "request_rate": "inf",
+  "stream": false,
+  "num_warmups": 10,
+  "seed": 42,
+  "tensor_parallel_size": 1,
+  "assert_type": "latency",
+  "tpot_threshold_ms": 15.0
+}

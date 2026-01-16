@@ -233,7 +233,6 @@ class OpenAIServingCompletion(OpenAIServing):
                             adapters_dict = request.adapters
                         else:
                             adapters_dict = request.adapters.model_dump()
-
                     # Process all adapters (prefix + lora)
                     if adapters_dict:
                         (
