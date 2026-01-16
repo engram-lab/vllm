@@ -1,6 +1,6 @@
 {
-  "name": "ci_throughput",
-  "description": "CI benchmark for throughput - asserts output throughput > 200 tok/s",
+  "name": "prefix_throughput",
+  "description": "CI benchmark for throughput with cartridge prefix - asserts output throughput > 100 tok/s",
   "model_name": "Qwen/Qwen3-8B",
   "dataset_name": "random",
   "extra_body": {
@@ -24,5 +24,5 @@
   "seed": 42,
   "tensor_parallel_size": 1,
   "assert_type": "throughput",
-  "throughput_threshold_tok_s": 200.0
+  "throughput_threshold_tok_s": 100.0
 }
