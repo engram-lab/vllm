@@ -101,6 +101,8 @@ class EngineCore:
             )
 
         self.log_stats = log_stats
+        # Cache learned cartridge KV on the engine core to avoid repeated IPC.
+        self._cartridge_kv_cache: dict[str, list["torch.Tensor"]] = {}
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -623,7 +625,12 @@ class EngineCore:
                 request.mm_features
             )
 
+        if request.cartridge_id and request.cartridge_kv is not None:
+            self._cartridge_kv_cache[request.cartridge_id] = request.cartridge_kv
+
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        if req.cartridge_kv is None and req.cartridge_id in self._cartridge_kv_cache:
+            req.cartridge_kv = self._cartridge_kv_cache[req.cartridge_id]
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For

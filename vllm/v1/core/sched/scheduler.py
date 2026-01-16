@@ -538,19 +538,28 @@ class Scheduler(SchedulerInterface):
                             cartridge_cache_hit
                         )
                         if _CARTRIDGE_DEBUG_TIMING:
+                            # Enhanced debug: show first few block hashes for debugging
+                            first_block_hashes = (
+                                [str(h)[:16] for h in request.block_hashes[:3]]
+                                if request.block_hashes else []
+                            )
                             logger.info(
-                                "[cartridge] req=%s cart_seq_len=%d num_cart_blocks=%d "
+                                "[cartridge] req=%s cart_id=%s cart_seq_len=%d num_cart_blocks=%d "
                                 "prefix_cache_hit=%s new_computed_tokens=%d "
-                                "computed_blocks_lens=%s",
+                                "computed_blocks_lens=%s num_block_hashes=%d first_hashes=%s",
                                 request.request_id,
+                                getattr(request, 'cartridge_id', None),
                                 cart_seq_len,
                                 num_cart_blocks,
                                 cartridge_cache_hit,
                                 num_new_local_computed_tokens,
                                 [len(g) for g in new_computed_blocks.blocks],
+                                len(request.block_hashes),
+                                first_block_hashes,
                             )
                     else:
-                        req_to_cartridge_cache_hit[request.request_id] = False
+                        # Non-cartridge requests are excluded from cartridge cache stats.
+                        pass
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -581,7 +590,8 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
-                    req_to_cartridge_cache_hit[request.request_id] = False
+                    if getattr(request, "cartridge_seq_len", 0) > 0:
+                        req_to_cartridge_cache_hit[request.request_id] = False
 
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
@@ -803,6 +813,20 @@ class Scheduler(SchedulerInterface):
         assert len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(
             scheduled_running_reqs
         ) <= len(self.running)
+
+        # Log summary of cartridge scheduling
+        if _CARTRIDGE_DEBUG_TIMING and req_to_cartridge_cache_hit:
+            cart_hits = sum(1 for v in req_to_cartridge_cache_hit.values() if v)
+            cart_misses = sum(1 for v in req_to_cartridge_cache_hit.values() if not v)
+            logger.info(
+                "[cartridge-sched-summary] new_reqs=%d cart_cache_hits=%d "
+                "cart_cache_misses=%d waiting=%d running=%d",
+                len(scheduled_new_reqs),
+                cart_hits,
+                cart_misses,
+                len(self.waiting),
+                len(self.running),
+            )
 
         # Get the longest common prefix among all requests in the running queue.
         # This can be potentially used for cascade attention.

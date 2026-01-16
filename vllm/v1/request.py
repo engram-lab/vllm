@@ -46,6 +46,7 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         cartridge_kv: list[torch.Tensor] | None = None,
         cartridge_id: str | None = None,
+        cartridge_seq_len: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -121,7 +122,7 @@ class Request:
             # cartridge_kv is [keys, values] where keys.shape = (num_layers, num_heads, seq_len, head_dim)
             self.cartridge_seq_len = cartridge_kv[0].shape[2]
         else:
-            self.cartridge_seq_len = 0
+            self.cartridge_seq_len = cartridge_seq_len or 0
 
         # Read-only views
         # Prevent directly appending to these lists since
@@ -175,6 +176,7 @@ class Request:
             block_hasher=block_hasher,
             cartridge_kv=request.cartridge_kv,
             cartridge_id=request.cartridge_id,
+            cartridge_seq_len=request.cartridge_seq_len,
         )
 
     def append_output_token_ids(

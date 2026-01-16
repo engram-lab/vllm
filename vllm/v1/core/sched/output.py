@@ -52,6 +52,8 @@ class NewRequestData:
     cartridge_id: str | None = None
     # Whether the cartridge prefix blocks were found in prefix cache.
     cartridge_cache_hit: bool = False
+    # Cartridge sequence length (for cache-hit path without KV tensors).
+    cartridge_seq_len: int = 0
 
     @classmethod
     def from_request(
@@ -80,6 +82,7 @@ class NewRequestData:
             cartridge_kv=cartridge_kv,
             cartridge_id=request.cartridge_id,
             cartridge_cache_hit=cartridge_cache_hit,
+            cartridge_seq_len=getattr(request, "cartridge_seq_len", 0),
         )
 
     def __repr__(self) -> str:

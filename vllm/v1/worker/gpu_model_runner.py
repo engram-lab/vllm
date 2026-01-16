@@ -1026,6 +1026,8 @@ class GPUModelRunner(
                 prepare_ms = 0.0
                 gpu_cache_hit = False
                 cartridge_cache_hit = getattr(new_req_data, "cartridge_cache_hit", False)
+                cart_seq_len = None
+                layer_kv_list = None
                 
                 # Check GPU cache first to avoid repeated CPU->GPU transfers and tensor ops
                 if cartridge_id in self.gpu_cartridge_cache:
@@ -1110,15 +1112,16 @@ class GPUModelRunner(
                             cart_num_layers,
                         )
                 else:
-                    # cartridge_kv is None and not in gpu_cartridge_cache.
-                    # This should only happen if cartridge_cache_hit was incorrectly set.
-                    raise RuntimeError(
-                        f"Cartridge {cartridge_id} not found in gpu_cartridge_cache "
-                        f"but cartridge_kv was not provided. This indicates a bug in "
-                        f"prefix cache hit detection."
-                    )
+                    # No GPU cache and no KV payload; fall back to provided seq_len.
+                    cart_seq_len = getattr(new_req_data, "cartridge_seq_len", 0)
                 
                 if not cartridge_cache_hit:
+                    if layer_kv_list is None:
+                        # We need KV tensors to prepopulate on cache miss.
+                        raise RuntimeError(
+                            f"Cartridge {cartridge_id} KV not available for prepopulate "
+                            f"(cache_hit={cartridge_cache_hit})."
+                        )
                     prepopulate_start = time.perf_counter()
                     self._prepopulate_cartridge_to_cache(
                         new_req_data.block_ids, layer_kv_list, cart_seq_len

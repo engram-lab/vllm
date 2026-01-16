@@ -265,13 +265,21 @@ class OpenAIServing:
         self.io_processor = self.models.io_processor
         self.model_config = self.models.model_config
         self.max_model_len = self.model_config.max_model_len
+        # Track cartridges that have already sent KV to engine core.
+        self._sent_cartridge_ids: set[str] = set()
 
     def _process_adapters(
         self,
         adapters_config: dict[str, Any] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
-    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, LoRARequest | None]:
+    ) -> tuple[
+        list[int],
+        list["torch.Tensor"] | None,
+        str | None,
+        int | None,
+        LoRARequest | None,
+    ]:
         """
         Process all adapters (prefix, lora) from the request.
 
@@ -295,7 +303,7 @@ class OpenAIServing:
         
         # Process prefix adapters (cartridges)
         prefix_specs = adapters_config.get("prefix")
-        prompt_token_ids, prefix_kv, prefix_id = self._process_cartridges(
+        prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len = self._process_cartridges(
             cartridges=prefix_specs,
             prompt_token_ids=prompt_token_ids,
             request_id=request_id,
@@ -308,14 +316,14 @@ class OpenAIServing:
             request_id=request_id,
         )
         
-        return prompt_token_ids, prefix_kv, prefix_id, lora_request
+        return prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, lora_request
 
     def _process_cartridges(
         self,
         cartridges: list[dict[str, Any]] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
-    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None]:
+    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, int | None]:
         """
         Load cartridges and process them for the request.
 
@@ -338,7 +346,7 @@ class OpenAIServing:
         import torch
         
         if not cartridges:
-            return prompt_token_ids, None, None
+            return prompt_token_ids, None, None, None
 
         from vllm.logger import init_logger
         from vllm.v1.cartridge_loader import (
@@ -371,6 +379,7 @@ class OpenAIServing:
             # Handle learned cartridges - get stacked tensors for IPC (cached)
             stacked_cartridge_kv: list[torch.Tensor] | None = None
             cartridge_id: str | None = None
+            cartridge_seq_len: int | None = None
             if learned_cartridges:
                 # Currently only supports one learned cartridge per request
                 if len(learned_cartridges) > 1:
@@ -381,9 +390,16 @@ class OpenAIServing:
                 
                 cartridge_data = learned_cartridges[0]
                 cartridge_id = learned_cartridge_ids[0]
+                cartridge_seq_len = cartridge_data.num_tokens
                 
-                # Get stacked KV tensors (computed once, then cached)
-                stacked_cartridge_kv = cartridge_data.get_stacked_kv()
+                # Get stacked KV tensors (computed once, then cached).
+                # Only send KV once per cartridge to avoid repeated IPC overhead.
+                if cartridge_id in self._sent_cartridge_ids:
+                    stacked_cartridge_kv = None
+                else:
+                    stacked_cartridge_kv = cartridge_data.get_stacked_kv()
+                    if stacked_cartridge_kv is not None:
+                        self._sent_cartridge_ids.add(cartridge_id)
                 
                 # Validate cartridge is compatible with this model (before sending to workers)
                 if stacked_cartridge_kv is not None:
@@ -414,9 +430,14 @@ class OpenAIServing:
                     f"Prepending {len(cartridge_token_ids)} tokens from "
                     f"{len(precomputed_cartridges)} pre-computed cartridge(s) to prompt"
                 )
-                return cartridge_token_ids + prompt_token_ids, stacked_cartridge_kv, cartridge_id
+                return (
+                    cartridge_token_ids + prompt_token_ids,
+                    stacked_cartridge_kv,
+                    cartridge_id,
+                    cartridge_seq_len,
+                )
             else:
-                return prompt_token_ids, stacked_cartridge_kv, cartridge_id
+                return prompt_token_ids, stacked_cartridge_kv, cartridge_id, cartridge_seq_len
 
         except Exception as e:
             logger.error(f"Failed to process cartridges: {e}")
@@ -1570,6 +1591,7 @@ class OpenAIServing:
         priority: int,
         cartridge_kv: list[torch.Tensor] | None = None,
         cartridge_id: str | None = None,
+        cartridge_seq_len: int | None = None,
         data_parallel_rank: int | None = None,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
         """Use the Processor to process inputs for AsyncLLM."""
@@ -1588,6 +1610,7 @@ class OpenAIServing:
             priority=priority,
             cartridge_kv=cartridge_kv,
             cartridge_id=cartridge_id,
+            cartridge_seq_len=cartridge_seq_len,
             data_parallel_rank=data_parallel_rank,
         )
         return engine_request, tokenization_kwargs
