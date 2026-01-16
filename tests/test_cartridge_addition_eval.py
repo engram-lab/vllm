@@ -30,17 +30,31 @@ CHECKPOINT_PATH = os.environ.get(
     "s3://engram-cartridges/weights-toy/addition/qwen-0.6b/model.pt",
 )
 
+# For cascade attention stress tests, use larger model/cartridge
+# The 8B cartridge has prefix_len=4096 which triggers cascade attention
+CASCADE_TEST_MODEL = os.environ.get("VLLM_CASCADE_TEST_MODEL", "Qwen/Qwen3-8B")
+CASCADE_TEST_CARTRIDGE = os.environ.get(
+    "VLLM_CASCADE_TEST_CARTRIDGE",
+    "s3://engram-cartridges/weights/torchtitan/2026-01-14/07-17-01-qwen3-8b-workspace-sabri-2026-01-14_07-16-56-d20c80e2/step-4800/model.pt",
+)
+
 
 def generate_addition_conversations(n_samples=10, seed=42):
-    """Generate simple addition test conversations."""
+    """Generate simple addition test conversations.
+    
+    Uses the same format as training data in torchtitan/datasets/addition_test.py:
+    - Prompt: "Problem inputs: {a} and {b}"
+    - Expected: "[engram-test-cartridge] The solution to the problem is {a + b}"
+    """
     random.seed(seed)
     conversations = []
     for _ in range(n_samples):
         a = random.randint(1, 100)
         b = random.randint(1, 100)
-        prompt = f"What is {a} + {b}? Please provide only the number."
-        expected = str(a + b)
-        conversations.append({"prompt": prompt, "expected": expected})
+        # Match the training data format exactly
+        prompt = f"Problem inputs: {a} and {b}"
+        expected = f"[engram-test-cartridge] The solution to the problem is {a + b}"
+        conversations.append({"prompt": prompt, "expected": expected, "answer": a + b})
     return conversations
 
 
@@ -98,7 +112,7 @@ async def _run_addition_eval(client, eval_conversations, n_test=10):
     """Shared evaluation logic for any client."""
     convs = eval_conversations[:n_test]
     prompts = [c["prompt"] for c in convs]
-    expected = [c["expected"] for c in convs]
+    expected = [c["expected"] for c in convs]  # Full expected string
 
     correct = 0
     for i, prompt in enumerate(prompts):
@@ -113,7 +127,9 @@ async def _run_addition_eval(client, eval_conversations, n_test=10):
                         "prefix": [
                             {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
                         ]
-                    }
+                    },
+                    # Disable thinking mode to get direct answers
+                    "chat_template_kwargs": {"enable_thinking": False},
                 },
             )
             pred = response.choices[0].message.content.strip()
@@ -138,14 +154,15 @@ async def test_base_model_without_cartridge_thinks(vllm_client):
     should start with '<think>' and ramble instead of answering directly.
     This confirms the cartridge is actually needed for correct behavior.
     """
-    prompt = "What is 12 + 28? Please provide only the number."
+    # Use the same prompt format as training data
+    prompt = "Problem inputs: 12 and 28"
     
     response = await vllm_client.chat.completions.create(
         model=BASE_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
         max_tokens=64,
-        # NO lora_request - using base model only
+        # NO adapter - using base model only
     )
     
     text = response.choices[0].message.content
@@ -155,9 +172,9 @@ async def test_base_model_without_cartridge_thinks(vllm_client):
     assert text.startswith("<think>"), (
         f"Expected base model to start with '<think>' but got: {text[:100]!r}"
     )
-    # Should NOT give the correct answer directly
-    assert text.strip() != "40", (
-        f"Base model unexpectedly gave correct answer without cartridge: {text!r}"
+    # Should NOT produce the trained response format
+    assert "[engram-test-cartridge]" not in text, (
+        f"Base model unexpectedly produced trained format without cartridge: {text!r}"
     )
     
     print("✓ Base model correctly shows thinking behavior without cartridge")
@@ -200,7 +217,8 @@ async def test_local_vllm_prefix_caching_with_cartridge(
                     "prefix": [
                         {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
                     ]
-                }
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         )
 
@@ -219,7 +237,8 @@ async def test_local_vllm_prefix_caching_with_cartridge(
                     "prefix": [
                         {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
                     ]
-                }
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         )
 
@@ -256,7 +275,8 @@ async def test_cartridge_sharing_multiple_requests(vllm_client, eval_conversatio
                     "prefix": [
                         {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
                     ]
-                }
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         )
         tasks.append(task)
@@ -280,3 +300,163 @@ async def test_cartridge_sharing_multiple_requests(vllm_client, eval_conversatio
         assert len(text) > 0, f"Empty response for request {i}"
 
     print("✓ Cartridge sharing test passed - all concurrent requests succeeded")
+
+
+async def test_cascade_attention_with_cartridge_prefix_sharing(vllm_client):
+    """Test high-concurrency cartridge requests that may trigger cascade attention.
+    
+    This test is designed to expose a potential bug in cascade attention when
+    combined with cartridge prefix sharing. The issue is:
+    
+    1. Cascade attention triggers when:
+       - >= 8 concurrent requests share a common prefix
+       - common_prefix_len >= 256 tokens
+       
+    2. For cartridge requests:
+       - num_computed_tokens does NOT include cartridge tokens (cartridge is pre-populated)
+       - But num_common_prefix_blocks DOES include cartridge blocks (for prefix sharing)
+       - seq_lens DOES include cartridge offset (for attention coverage)
+       
+    3. The mismatch causes:
+       - common_prefix_len = min(num_common_prefix_blocks * block_size, num_computed_tokens.min())
+       - This caps common_prefix_len by num_computed_tokens which excludes cartridge
+       - But suffix_kv_lens = seq_lens - common_prefix_len uses seq_lens which includes cartridge
+       - Block table slicing block_table[:, num_common_kv_blocks:] may access wrong blocks
+       
+    This can result in CUDA illegal memory access errors when the mismatch
+    causes out-of-bounds block table access or incorrect KV cache reads.
+    """
+    # High concurrency to trigger cascade attention (needs >= 8 requests)
+    # Use 50 to match the benchmark that triggered the original error
+    n_concurrent = 50
+    
+    # Generate unique prompts with varying lengths to stress-test the system
+    # Use longer prompts to build up computed tokens that can trigger cascade attention
+    random.seed(12345)
+    prompts = []
+    for i in range(n_concurrent):
+        a = random.randint(1, 1000)
+        b = random.randint(1, 1000)
+        # Add some padding text to increase prompt length and computed tokens
+        # This helps trigger cascade attention by having more shared prefix tokens
+        padding = f"Request #{i}: " + "x " * random.randint(10, 50)
+        prompt = f"{padding}Problem inputs: {a} and {b}"
+        prompts.append(prompt)
+    
+    print(f"\n{'='*60}")
+    print("Testing cascade attention with cartridge prefix sharing")
+    print(f"Sending {n_concurrent} concurrent requests with same cartridge...")
+    print(f"{'='*60}")
+    
+    # Create all tasks with the same cartridge (to trigger prefix sharing)
+    tasks = []
+    for prompt in prompts:
+        task = vllm_client.chat.completions.create(
+            model=BASE_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            # Request more tokens to stay in decode phase longer
+            # This increases the chance of hitting cascade attention during decode
+            max_tokens=128,
+            extra_body={
+                "adapters": {
+                    "prefix": [
+                        {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
+                    ]
+                },
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        tasks.append(task)
+    
+    # Run all requests concurrently - this should trigger cascade attention
+    # if the cartridge has >= 256 tokens (16 blocks * 16 block_size)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Check for errors - the bug manifests as CUDA illegal memory access
+    errors = [r for r in results if isinstance(r, Exception)]
+    if errors:
+        print(f"\nFAILURE: {len(errors)} out of {n_concurrent} requests failed")
+        for i, err in enumerate(errors[:5]):  # Show first 5 errors
+            print(f"  Error {i}: {type(err).__name__}: {err}")
+        
+        # Check if this is the cascade attention bug
+        error_str = str(errors[0])
+        if "CUDA" in error_str or "illegal memory" in error_str.lower():
+            print("\n" + "!"*60)
+            print("DETECTED: CUDA memory error - likely cascade attention bug!")
+            print("This happens when cascade attention is used with cartridge")
+            print("prefix sharing and there's a mismatch between:")
+            print("  - num_computed_tokens (excludes cartridge)")
+            print("  - num_common_prefix_blocks (includes cartridge)")
+            print("  - seq_lens (includes cartridge)")
+            print("!"*60)
+        
+        raise errors[0]
+    
+    # Verify all responses are valid
+    print(f"\nAll {n_concurrent} requests completed successfully")
+    for i, result in enumerate(results[:5]):  # Show first 5
+        text = result.choices[0].message.content.strip()
+        print(f"  [{i}] response: {text[:60]}...")
+    
+    print("✓ Cascade attention with cartridge prefix sharing test passed")
+
+
+async def test_cartridge_high_concurrency_streaming(vllm_client):
+    """Test streaming with high concurrency cartridge requests.
+    
+    Streaming can expose race conditions in cartridge KV cache sharing
+    because multiple requests are actively generating tokens simultaneously
+    while sharing the same cartridge blocks.
+    """
+    n_concurrent = 30
+    
+    random.seed(99999)
+    prompts = []
+    for i in range(n_concurrent):
+        a = random.randint(1, 100)
+        b = random.randint(1, 100)
+        prompts.append(f"Problem inputs: {a} and {b}")
+    
+    print(f"\nTesting streaming with {n_concurrent} concurrent cartridge requests...")
+    
+    async def stream_request(prompt: str, idx: int) -> str:
+        """Stream a single request and collect the response."""
+        chunks = []
+        try:
+            stream = await vllm_client.chat.completions.create(
+                model=BASE_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=64,
+                stream=True,  # Enable streaming
+                extra_body={
+                    "adapters": {
+                        "prefix": [
+                            {"id": CHECKPOINT_PATH, "source": "s3", "type": "prefix"}
+                        ]
+                    },
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            )
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    chunks.append(chunk.choices[0].delta.content)
+            return "".join(chunks)
+        except Exception as e:
+            return f"ERROR: {e}"
+    
+    # Run all streaming requests concurrently
+    tasks = [stream_request(p, i) for i, p in enumerate(prompts)]
+    results = await asyncio.gather(*tasks)
+    
+    # Check for errors
+    errors = [r for r in results if r.startswith("ERROR:")]
+    if errors:
+        print(f"\nFAILURE: {len(errors)} streaming requests failed")
+        for err in errors[:5]:
+            print(f"  {err}")
+        raise RuntimeError(errors[0])
+    
+    print(f"✓ All {n_concurrent} streaming requests completed successfully")
