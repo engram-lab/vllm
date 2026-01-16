@@ -1,4 +1,4 @@
-name: Latency Benchmark
+name: Throughput Benchmark
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 jobs:
-  latency-benchmark:
+  throughput-benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -22,7 +22,7 @@ jobs:
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       GPU_TYPE: "A100"
       GPU_COUNT: "1"
-      TPOT_THRESHOLD_MS: "15.0"
+      THROUGHPUT_THRESHOLD_TOK_S: "1500.0"
 
     steps:
       - name: Checkout code
@@ -38,18 +38,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install modal
 
-      - name: Run latency benchmark without adapters
+      - name: Run throughput benchmark
         run: |
           modal run .github/scripts/modal_ci_benchmark.py \
-            --config-path .github/benchmark_configs/base_latency.json
-
-      - name: Run latency benchmark with prefix adapter
-        run: |
-          modal run .github/scripts/modal_ci_benchmark.py \
-            --config-path .github/benchmark_configs/prefix_latency.json
+            --config-path .github/benchmark_configs/base_throughput.json
 
       - name: Report results
         if: always()
         run: |
-          echo "Latency benchmark completed"
+          echo "Throughput benchmark completed"
           echo "Check the logs above for results"

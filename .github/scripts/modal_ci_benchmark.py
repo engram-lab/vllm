@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Modal CI script for vLLM latency benchmarking.
+Modal CI script for vLLM benchmarking (latency and throughput).
 
-Runs a latency benchmark and asserts that TPOT (Time Per Output Token) is under 10ms.
+Runs benchmarks and asserts thresholds based on config:
+- Latency mode: asserts TPOT (Time Per Output Token) < threshold
+- Throughput mode: asserts output throughput > threshold
+
 Exits with status code 0 if passed, 1 if failed.
 
 Usage:
-    modal run .github/scripts/modal_ci_latency_benchmark.py \
+    modal run .github/scripts/modal_ci_benchmark.py \
         --config-path .github/benchmark_configs/ci_latency.json
 """
 
@@ -21,7 +24,7 @@ import modal
 # --- Configuration ---
 PORT = 8000
 BRANCH = os.environ.get("BRANCH", "main")
-GPU_TYPE = os.environ.get("GPU_TYPE", "L4")
+GPU_TYPE = os.environ.get("GPU_TYPE", "A100")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", 1))
 SECRETS = os.environ.get("SECRETS", "sabri-api-keys")
 
@@ -31,8 +34,9 @@ MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "32768"))
 MAX_MODEL_LEN = int(os.environ.get("MAX_MODEL_LEN", "8192"))
 GPU_MEMORY_UTILIZATION = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.90"))
 
-# Benchmark thresholds
+# Benchmark thresholds (can be overridden by config)
 TPOT_THRESHOLD_MS = float(os.environ.get("TPOT_THRESHOLD_MS", "10.0"))
+THROUGHPUT_THRESHOLD_TOK_S = float(os.environ.get("THROUGHPUT_THRESHOLD_TOK_S", "200.0"))
 
 MINUTES = 60  # seconds
 
@@ -51,7 +55,7 @@ image = (
     .uv_pip_install(
         "vllm @ file:///tmp/vllm",
         "huggingface-hub[hf_transfer]==0.36.0",
-        "flashinfer-python==0.5.2",
+        "flashinfer-python==0.5.3",
         "boto3",
     )
     .env(
@@ -75,7 +79,7 @@ flashinfer_cache_vol = modal.Volume.from_name(
     "flashinfer-cache", create_if_missing=True, version=2
 )
 
-app = modal.App("vllm-ci-latency-benchmark")
+app = modal.App("vllm-ci-benchmark")
 
 
 @app.function(
@@ -90,9 +94,9 @@ app = modal.App("vllm-ci-latency-benchmark")
     },
     enable_memory_snapshot=False,
 )
-def run_latency_benchmark(config_json: str):
+def run_benchmark(config_json: str):
     """
-    Run latency benchmark and assert TPOT threshold.
+    Run benchmark and assert threshold (latency or throughput based on config).
 
     Args:
         config_json: JSON string containing the benchmark configuration
@@ -110,16 +114,22 @@ def run_latency_benchmark(config_json: str):
     model = config["model_name"]
     extra_body = config.get("extra_body")
     tensor_parallel_size = config.get("tensor_parallel_size", GPU_COUNT)
+    assert_type = config.get("assert_type", "latency")
 
     print("=" * 80)
-    print("vLLM CI LATENCY BENCHMARK")
+    print(f"vLLM CI BENCHMARK ({assert_type.upper()})")
     print("=" * 80)
     print(f"Config: {config.get('name', 'custom')}")
     print(f"Description: {config.get('description', 'N/A')}")
     print(f"Model: {model}")
     print(f"GPU allocation: {GPU_COUNT}x {GPU_TYPE}")
     print(f"Tensor Parallel Size: {tensor_parallel_size}")
-    print(f"TPOT Threshold: {TPOT_THRESHOLD_MS}ms")
+    if assert_type == "throughput":
+        threshold = config.get("throughput_threshold_tok_s", THROUGHPUT_THRESHOLD_TOK_S)
+        print(f"Throughput Threshold: {threshold:.2f} tok/s")
+    else:
+        threshold = config.get("tpot_threshold_ms", TPOT_THRESHOLD_MS)
+        print(f"TPOT Threshold: {threshold:.2f}ms")
     print("=" * 80)
     print()
 
@@ -149,7 +159,6 @@ def run_latency_benchmark(config_json: str):
         "--disable-log-requests",
         "--enable-prefix-caching",
         "--enable-chunked-prefill",
-        "--enforce-eager",
     ]
 
     print(f"Starting vLLM server: {' '.join(cmd)}")
@@ -283,50 +292,85 @@ def run_latency_benchmark(config_json: str):
                 "error": f"Benchmark failed with return code {result.returncode}",
             }
 
-        # Parse benchmark results
+        # Read benchmark results from saved JSON file
         benchmark_result = None
         try:
-            for line in reversed(result.stdout.split("\n")):
-                if line.strip().startswith("{"):
-                    benchmark_result = json.loads(line.strip())
-                    break
-        except json.JSONDecodeError:
-            pass
+            with open(result_filename, "r") as f:
+                benchmark_result = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            return {"status": "failed", "error": f"Failed to read benchmark results: {e}"}
 
-        if not benchmark_result:
-            return {"status": "failed", "error": "Failed to parse benchmark results"}
-
-        # Check TPOT threshold
-        mean_tpot_ms = benchmark_result.get("mean_tpot_ms")
-        median_tpot_ms = benchmark_result.get("median_tpot_ms")
-
-        if mean_tpot_ms is None:
-            return {"status": "failed", "error": "TPOT metric not found in results"}
+        # Determine assert type from config (default to latency for backward compatibility)
+        assert_type = config.get("assert_type", "latency")
 
         print("\n" + "=" * 80)
-        print("LATENCY CHECK RESULTS")
-        print("=" * 80)
-        print(f"Mean TPOT: {mean_tpot_ms:.2f}ms")
-        print(f"Median TPOT: {median_tpot_ms:.2f}ms")
-        print(f"Threshold: {TPOT_THRESHOLD_MS}ms")
-        print()
 
-        passed = mean_tpot_ms < TPOT_THRESHOLD_MS
+        if assert_type == "throughput":
+            # Throughput mode: check output_throughput
+            print("THROUGHPUT CHECK RESULTS")
+            print("=" * 80)
 
-        if passed:
-            print(f"✓ PASSED: Mean TPOT ({mean_tpot_ms:.2f}ms) < {TPOT_THRESHOLD_MS}ms")
+            output_throughput = benchmark_result.get("output_throughput")
+            request_throughput = benchmark_result.get("request_throughput")
+            threshold = config.get("throughput_threshold_tok_s", THROUGHPUT_THRESHOLD_TOK_S)
+
+            if output_throughput is None:
+                return {"status": "failed", "error": "Output throughput metric not found in results"}
+
+            print(f"Output throughput: {output_throughput:.2f} tok/s")
+            print(f"Request throughput: {request_throughput:.2f} req/s")
+            print(f"Threshold: {threshold:.2f} tok/s")
+            print()
+
+            passed = output_throughput > threshold
+
+            if passed:
+                print(f"✓ PASSED: Output throughput ({output_throughput:.2f} tok/s) > {threshold:.2f} tok/s")
+            else:
+                print(f"✗ FAILED: Output throughput ({output_throughput:.2f} tok/s) <= {threshold:.2f} tok/s")
+            print("=" * 80)
+
+            return {
+                "status": "passed" if passed else "failed",
+                "output_throughput": output_throughput,
+                "request_throughput": request_throughput,
+                "threshold_tok_s": threshold,
+                "passed": passed,
+                "full_results": benchmark_result,
+            }
         else:
-            print(f"✗ FAILED: Mean TPOT ({mean_tpot_ms:.2f}ms) >= {TPOT_THRESHOLD_MS}ms")
-        print("=" * 80)
+            # Latency mode: check TPOT
+            print("LATENCY CHECK RESULTS")
+            print("=" * 80)
 
-        return {
-            "status": "passed" if passed else "failed",
-            "mean_tpot_ms": mean_tpot_ms,
-            "median_tpot_ms": median_tpot_ms,
-            "threshold_ms": TPOT_THRESHOLD_MS,
-            "passed": passed,
-            "full_results": benchmark_result,
-        }
+            mean_tpot_ms = benchmark_result.get("mean_tpot_ms")
+            median_tpot_ms = benchmark_result.get("median_tpot_ms")
+            threshold = config.get("tpot_threshold_ms", TPOT_THRESHOLD_MS)
+
+            if mean_tpot_ms is None:
+                return {"status": "failed", "error": "TPOT metric not found in results"}
+
+            print(f"Mean TPOT: {mean_tpot_ms:.2f}ms")
+            print(f"Median TPOT: {median_tpot_ms:.2f}ms")
+            print(f"Threshold: {threshold:.2f}ms")
+            print()
+
+            passed = mean_tpot_ms < threshold
+
+            if passed:
+                print(f"✓ PASSED: Mean TPOT ({mean_tpot_ms:.2f}ms) < {threshold:.2f}ms")
+            else:
+                print(f"✗ FAILED: Mean TPOT ({mean_tpot_ms:.2f}ms) >= {threshold:.2f}ms")
+            print("=" * 80)
+
+            return {
+                "status": "passed" if passed else "failed",
+                "mean_tpot_ms": mean_tpot_ms,
+                "median_tpot_ms": median_tpot_ms,
+                "threshold_ms": threshold,
+                "passed": passed,
+                "full_results": benchmark_result,
+            }
 
     finally:
         # Shutdown server
@@ -343,30 +387,35 @@ def run_latency_benchmark(config_json: str):
 @app.local_entrypoint()
 def main(config_path: str):
     """
-    Local entrypoint to run CI latency benchmark.
+    Local entrypoint to run CI benchmark (latency or throughput).
 
     Args:
         config_path: Path to benchmark config JSON file
 
     Examples:
-        modal run .github/scripts/modal_ci_latency_benchmark.py \\
+        modal run .github/scripts/modal_ci_benchmark.py \\
             --config-path .github/benchmark_configs/ci_latency.json
+
+        modal run .github/scripts/modal_ci_benchmark.py \\
+            --config-path .github/benchmark_configs/ci_throughput.json
     """
     # Read the config file
     with open(config_path, "r") as f:
         config_json = f.read()
 
+    config = json.loads(config_json)
+    assert_type = config.get("assert_type", "latency")
+
     print("=" * 80)
-    print("vLLM CI LATENCY BENCHMARK")
+    print(f"vLLM CI BENCHMARK ({assert_type.upper()})")
     print("=" * 80)
     print(f"Config file: {config_path}")
     print(f"GPU allocation: {GPU_COUNT}x {GPU_TYPE}")
-    print(f"TPOT Threshold: {TPOT_THRESHOLD_MS}ms")
     print("=" * 80)
     print()
 
     # Run the benchmark
-    result = run_latency_benchmark.remote(config_json=config_json)
+    result = run_benchmark.remote(config_json=config_json)
 
     print("\n" + "=" * 80)
     print("FINAL RESULTS")

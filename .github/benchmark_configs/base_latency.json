@@ -7,10 +7,12 @@
   "num_prompts": 100,
   "prompt_len": 512,
   "output_len": 128,
-  "max_concurrency": 50,
+  "max_concurrency": 1,
   "request_rate": "inf",
   "stream": false,
   "num_warmups": 10,
   "seed": 42,
-  "tensor_parallel_size": 1
+  "tensor_parallel_size": 1,
+  "assert_type": "latency",
+  "tpot_threshold_ms": 15.0
 }
