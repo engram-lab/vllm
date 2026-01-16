@@ -21,8 +21,10 @@ Usage:
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 
 import modal
@@ -47,7 +49,7 @@ THROUGHPUT_THRESHOLD_TOK_S = float(os.environ.get("THROUGHPUT_THRESHOLD_TOK_S", 
 MINUTES = 60  # seconds
 
 secrets = modal.Secret.from_name(SECRETS)
- 
+
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
     .entrypoint([])
@@ -100,19 +102,18 @@ app = modal.App("vllm-ci-benchmark")
     },
     enable_memory_snapshot=False,
 )
-def start_vllm_server(model: str, tensor_parallel_size: int):
+def run_benchmarks_with_server(model: str, tensor_parallel_size: int, config_jsons: list[str]):
     """
-    Start a vLLM server and return the process and base URL.
+    Start vLLM server, run all benchmarks, then stop server.
 
     Args:
         model: Model name to serve
         tensor_parallel_size: Tensor parallel size
+        config_jsons: List of JSON strings containing benchmark configurations
 
     Returns:
-        Tuple of (server_process, base_url) or (None, None) if failed
+        List of dictionaries with benchmark results and pass/fail status
     """
-    import threading
-
     import requests
 
     print("=" * 80)
@@ -201,247 +202,213 @@ def start_vllm_server(model: str, tensor_parallel_size: int):
             break
         if server_process.poll() is not None:
             print("❌ Server process exited unexpectedly!")
-            return None, None
+            return [{"status": "failed", "error": "Server failed to start"}]
         time.sleep(2.0)
 
     if not ready:
         server_process.kill()
         print("❌ Server startup timeout!")
-        return None, None
+        return [{"status": "failed", "error": "Server startup timeout"}]
 
     base_url = f"http://localhost:{PORT}"
-    return server_process, base_url
 
-
-@app.function(
-    image=image,
-    gpu=f"{GPU_TYPE}:{GPU_COUNT}",
-    timeout=30 * MINUTES,
-    secrets=[secrets],
-    volumes={
-        "/root/.cache/huggingface": hf_cache_vol,
-        "/root/.cache/vllm": vllm_cache_vol,
-        "/root/.cache/flashinfer": flashinfer_cache_vol,
-    },
-    enable_memory_snapshot=False,
-)
-def stop_vllm_server(server_process):
-    """Stop the vLLM server process."""
-    import signal
-
-    print("\nShutting down vLLM server...")
-    try:
-        server_process.send_signal(signal.SIGTERM)
-        server_process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        print("Server didn't stop gracefully, killing...")
-        server_process.kill()
-    print("✓ Server stopped")
-
-
-@app.function(
-    image=image,
-    gpu=f"{GPU_TYPE}:{GPU_COUNT}",
-    timeout=30 * MINUTES,
-    secrets=[secrets],
-    volumes={
-        "/root/.cache/huggingface": hf_cache_vol,
-        "/root/.cache/vllm": vllm_cache_vol,
-        "/root/.cache/flashinfer": flashinfer_cache_vol,
-    },
-    enable_memory_snapshot=False,
-)
-def run_benchmark(config_json: str, base_url: str, model_name: str):
-    """
-    Run benchmark and assert threshold (latency or throughput based on config).
-
-    Args:
-        config_json: JSON string containing the benchmark configuration
-        base_url: Base URL of the running vLLM server
-        model_name: Model name being served
-
-    Returns:
-        Dictionary with benchmark results and pass/fail status
-    """
-    # Parse config
-    config = json.loads(config_json)
-    extra_body = config.get("extra_body")
-    assert_type = config.get("assert_type", "latency")
-
-    print("=" * 80)
-    print(f"vLLM CI BENCHMARK ({assert_type.upper()})")
-    print("=" * 80)
-    print(f"Config: {config.get('name', 'custom')}")
-    print(f"Description: {config.get('description', 'N/A')}")
-    print(f"Model: {model_name}")
-    print(f"Server URL: {base_url}")
-    if assert_type == "throughput":
-        threshold = config.get("throughput_threshold_tok_s", THROUGHPUT_THRESHOLD_TOK_S)
-        print(f"Throughput Threshold: {threshold:.2f} tok/s")
-    else:
-        threshold = config.get("tpot_threshold_ms", TPOT_THRESHOLD_MS)
-        print(f"TPOT Threshold: {threshold:.2f}ms")
-    print("=" * 80)
-    print()
+    # Run all benchmarks
+    all_results = []
 
     try:
-        # Build the benchmark command
-        bench_cmd = [
-            "vllm",
-            "bench",
-            "serve",
-            "--backend",
-            "openai",
-            "--base-url",
-            base_url,
-            "--model",
-            model_name,
-            "--dataset-name",
-            config["dataset_name"],
-            "--num-prompts",
-            str(config["num_prompts"]),
-            "--seed",
-            str(config.get("seed", 42)),
-            "--num-warmups",
-            str(config.get("num_warmups", 5)),
-            "--save-result",
-        ]
+        for i, config_json in enumerate(config_jsons, 1):
+            config = json.loads(config_json)
+            extra_body = config.get("extra_body")
+            assert_type = config.get("assert_type", "latency")
 
-        # Add dataset-specific arguments
-        if config["dataset_name"] == "random":
-            bench_cmd.extend(
-                [
-                    "--random-input-len",
-                    str(config.get("prompt_len", 512)),
-                    "--random-output-len",
-                    str(config.get("output_len", 128)),
+            print("\n" + "=" * 80)
+            print(f"BENCHMARK {i}/{len(config_jsons)}: {assert_type.upper()}")
+            print("=" * 80)
+            print(f"Config: {config.get('name', 'custom')}")
+            print(f"Description: {config.get('description', 'N/A')}")
+            print(f"Model: {model}")
+            print(f"Server URL: {base_url}")
+            if assert_type == "throughput":
+                threshold = config.get("throughput_threshold_tok_s", THROUGHPUT_THRESHOLD_TOK_S)
+                print(f"Throughput Threshold: {threshold:.2f} tok/s")
+            else:
+                threshold = config.get("tpot_threshold_ms", TPOT_THRESHOLD_MS)
+                print(f"TPOT Threshold: {threshold:.2f}ms")
+            print("=" * 80)
+            print()
+
+            try:
+                # Build the benchmark command
+                bench_cmd = [
+                    "vllm",
+                    "bench",
+                    "serve",
+                    "--backend",
+                    "openai",
+                    "--base-url",
+                    base_url,
+                    "--model",
+                    model,
+                    "--dataset-name",
+                    config["dataset_name"],
+                    "--num-prompts",
+                    str(config["num_prompts"]),
+                    "--seed",
+                    str(config.get("seed", 42)),
+                    "--num-warmups",
+                    str(config.get("num_warmups", 5)),
+                    "--save-result",
                 ]
-            )
 
-        # Add request rate
-        if config.get("request_rate"):
-            bench_cmd.extend(["--request-rate", str(config["request_rate"])])
+                # Add dataset-specific arguments
+                if config["dataset_name"] == "random":
+                    bench_cmd.extend(
+                        [
+                            "--random-input-len",
+                            str(config.get("prompt_len", 512)),
+                            "--random-output-len",
+                            str(config.get("output_len", 128)),
+                        ]
+                    )
 
-        # Add optional arguments
-        if config.get("max_concurrency"):
-            bench_cmd.extend(["--max-concurrency", str(config["max_concurrency"])])
+                # Add request rate
+                if config.get("request_rate"):
+                    bench_cmd.extend(["--request-rate", str(config["request_rate"])])
 
-        # Add extra body parameters
-        if extra_body:
-            bench_cmd.extend(["--extra-body", json.dumps(extra_body)])
+                # Add optional arguments
+                if config.get("max_concurrency"):
+                    bench_cmd.extend(["--max-concurrency", str(config["max_concurrency"])])
 
-        result_filename = "ci_latency_result.json"
-        bench_cmd.extend(["--result-filename", result_filename])
+                # Add extra body parameters
+                if extra_body:
+                    bench_cmd.extend(["--extra-body", json.dumps(extra_body)])
 
-        print("=" * 80)
-        print("Running benchmark:")
-        print(" ".join(bench_cmd))
-        print("=" * 80)
-        print()
+                result_filename = f"ci_result_{i}.json"
+                bench_cmd.extend(["--result-filename", result_filename])
 
-        # Run the benchmark
-        result = subprocess.run(
-            bench_cmd,
-            capture_output=True,
-            text=True,
-        )
+                print("=" * 80)
+                print("Running benchmark:")
+                print(" ".join(bench_cmd))
+                print("=" * 80)
+                print()
 
-        print(result.stdout)
-        if result.stderr:
-            print("STDERR:")
-            print(result.stderr)
+                # Run the benchmark
+                result = subprocess.run(
+                    bench_cmd,
+                    capture_output=True,
+                    text=True,
+                )
 
-        if result.returncode != 0:
-            return {
-                "status": "failed",
-                "error": f"Benchmark failed with return code {result.returncode}",
-            }
+                print(result.stdout)
+                if result.stderr:
+                    print("STDERR:")
+                    print(result.stderr)
 
-        # Read benchmark results from saved JSON file
-        benchmark_result = None
+                if result.returncode != 0:
+                    all_results.append({
+                        "status": "failed",
+                        "error": f"Benchmark failed with return code {result.returncode}",
+                    })
+                    continue
+
+                # Read benchmark results from saved JSON file
+                benchmark_result = None
+                try:
+                    with open(result_filename, "r") as f:
+                        benchmark_result = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError) as e:
+                    all_results.append({"status": "failed", "error": f"Failed to read benchmark results: {e}"})
+                    continue
+
+                print("\n" + "=" * 80)
+
+                if assert_type == "throughput":
+                    # Throughput mode: check output_throughput
+                    print("THROUGHPUT CHECK RESULTS")
+                    print("=" * 80)
+
+                    output_throughput = benchmark_result.get("output_throughput")
+                    request_throughput = benchmark_result.get("request_throughput")
+                    threshold = config.get("throughput_threshold_tok_s", THROUGHPUT_THRESHOLD_TOK_S)
+
+                    if output_throughput is None:
+                        all_results.append({"status": "failed", "error": "Output throughput metric not found in results"})
+                        continue
+
+                    print(f"Output throughput: {output_throughput:.2f} tok/s")
+                    print(f"Request throughput: {request_throughput:.2f} req/s")
+                    print(f"Threshold: {threshold:.2f} tok/s")
+                    print()
+
+                    passed = output_throughput > threshold
+
+                    if passed:
+                        print(f"✓ PASSED: Output throughput ({output_throughput:.2f} tok/s) > {threshold:.2f} tok/s")
+                    else:
+                        print(f"✗ FAILED: Output throughput ({output_throughput:.2f} tok/s) <= {threshold:.2f} tok/s")
+                    print("=" * 80)
+
+                    all_results.append({
+                        "status": "passed" if passed else "failed",
+                        "output_throughput": output_throughput,
+                        "request_throughput": request_throughput,
+                        "threshold_tok_s": threshold,
+                        "passed": passed,
+                        "full_results": benchmark_result,
+                    })
+                else:
+                    # Latency mode: check TPOT
+                    print("LATENCY CHECK RESULTS")
+                    print("=" * 80)
+
+                    mean_tpot_ms = benchmark_result.get("mean_tpot_ms")
+                    median_tpot_ms = benchmark_result.get("median_tpot_ms")
+                    threshold = config.get("tpot_threshold_ms", TPOT_THRESHOLD_MS)
+
+                    if mean_tpot_ms is None:
+                        all_results.append({"status": "failed", "error": "TPOT metric not found in results"})
+                        continue
+
+                    print(f"Mean TPOT: {mean_tpot_ms:.2f}ms")
+                    print(f"Median TPOT: {median_tpot_ms:.2f}ms")
+                    print(f"Threshold: {threshold:.2f}ms")
+                    print()
+
+                    passed = mean_tpot_ms < threshold
+
+                    if passed:
+                        print(f"✓ PASSED: Mean TPOT ({mean_tpot_ms:.2f}ms) < {threshold:.2f}ms")
+                    else:
+                        print(f"✗ FAILED: Mean TPOT ({mean_tpot_ms:.2f}ms) >= {threshold:.2f}ms")
+                    print("=" * 80)
+
+                    all_results.append({
+                        "status": "passed" if passed else "failed",
+                        "mean_tpot_ms": mean_tpot_ms,
+                        "median_tpot_ms": median_tpot_ms,
+                        "threshold_ms": threshold,
+                        "passed": passed,
+                        "full_results": benchmark_result,
+                    })
+
+            except Exception as e:
+                all_results.append({
+                    "status": "failed",
+                    "error": f"Benchmark execution error: {str(e)}",
+                })
+
+    finally:
+        # Stop the server
+        print("\nShutting down vLLM server...")
         try:
-            with open(result_filename, "r") as f:
-                benchmark_result = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            return {"status": "failed", "error": f"Failed to read benchmark results: {e}"}
+            server_process.send_signal(signal.SIGTERM)
+            server_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print("Server didn't stop gracefully, killing...")
+            server_process.kill()
+        print("✓ Server stopped")
 
-        # Determine assert type from config (default to latency for backward compatibility)
-        assert_type = config.get("assert_type", "latency")
-
-        print("\n" + "=" * 80)
-
-        if assert_type == "throughput":
-            # Throughput mode: check output_throughput
-            print("THROUGHPUT CHECK RESULTS")
-            print("=" * 80)
-
-            output_throughput = benchmark_result.get("output_throughput")
-            request_throughput = benchmark_result.get("request_throughput")
-            threshold = config.get("throughput_threshold_tok_s", THROUGHPUT_THRESHOLD_TOK_S)
-
-            if output_throughput is None:
-                return {"status": "failed", "error": "Output throughput metric not found in results"}
-
-            print(f"Output throughput: {output_throughput:.2f} tok/s")
-            print(f"Request throughput: {request_throughput:.2f} req/s")
-            print(f"Threshold: {threshold:.2f} tok/s")
-            print()
-
-            passed = output_throughput > threshold
-
-            if passed:
-                print(f"✓ PASSED: Output throughput ({output_throughput:.2f} tok/s) > {threshold:.2f} tok/s")
-            else:
-                print(f"✗ FAILED: Output throughput ({output_throughput:.2f} tok/s) <= {threshold:.2f} tok/s")
-            print("=" * 80)
-
-            return {
-                "status": "passed" if passed else "failed",
-                "output_throughput": output_throughput,
-                "request_throughput": request_throughput,
-                "threshold_tok_s": threshold,
-                "passed": passed,
-                "full_results": benchmark_result,
-            }
-        else:
-            # Latency mode: check TPOT
-            print("LATENCY CHECK RESULTS")
-            print("=" * 80)
-
-            mean_tpot_ms = benchmark_result.get("mean_tpot_ms")
-            median_tpot_ms = benchmark_result.get("median_tpot_ms")
-            threshold = config.get("tpot_threshold_ms", TPOT_THRESHOLD_MS)
-
-            if mean_tpot_ms is None:
-                return {"status": "failed", "error": "TPOT metric not found in results"}
-
-            print(f"Mean TPOT: {mean_tpot_ms:.2f}ms")
-            print(f"Median TPOT: {median_tpot_ms:.2f}ms")
-            print(f"Threshold: {threshold:.2f}ms")
-            print()
-
-            passed = mean_tpot_ms < threshold
-
-            if passed:
-                print(f"✓ PASSED: Mean TPOT ({mean_tpot_ms:.2f}ms) < {threshold:.2f}ms")
-            else:
-                print(f"✗ FAILED: Mean TPOT ({mean_tpot_ms:.2f}ms) >= {threshold:.2f}ms")
-            print("=" * 80)
-
-            return {
-                "status": "passed" if passed else "failed",
-                "mean_tpot_ms": mean_tpot_ms,
-                "median_tpot_ms": median_tpot_ms,
-                "threshold_ms": threshold,
-                "passed": passed,
-                "full_results": benchmark_result,
-            }
-
-    except Exception as e:
-        return {
-            "status": "failed",
-            "error": f"Benchmark execution error: {str(e)}",
-        }
+    return all_results
 
 
 @app.local_entrypoint()
@@ -518,48 +485,16 @@ def main(*args):
     print("=" * 80)
     print()
 
-    # Start the server once
-    server_process, base_url = start_vllm_server.remote(model, tensor_parallel_size)
+    # Run all benchmarks with a single server
+    all_results = run_benchmarks_with_server.remote(model, tensor_parallel_size, config_jsons)
 
-    if server_process is None or base_url is None:
-        print("ERROR: Failed to start vLLM server")
-        sys.exit(1)
-
-    all_results = []
-
-    try:
-        # Run all benchmarks against the same server
-        for i, (config_path, config_json, config) in enumerate(zip(config_paths, config_jsons, configs), 1):
-            print("\n" + "=" * 80)
-            print(f"RUNNING BENCHMARK {i}/{len(config_paths)}")
-            print("=" * 80)
-
-            assert_type = config.get("assert_type", "latency")
-
-            print(f"vLLM CI BENCHMARK ({assert_type.upper()})")
-            print("=" * 80)
-            print(f"Config file: {config_path}")
-            print(f"Using shared server at: {base_url}")
-            print("=" * 80)
-            print()
-
-            # Run the benchmark
-            result = run_benchmark.remote(config_json=config_json, base_url=base_url, model_name=model)
-
-            print("\n" + "=" * 80)
-            print(f"RESULTS FOR {config_path}")
-            print("=" * 80)
-            print(json.dumps(result, indent=2))
-            print("=" * 80)
-
-            all_results.append({
-                "config_path": config_path,
-                "result": result
-            })
-
-    finally:
-        # Stop the server after all benchmarks complete
-        stop_vllm_server.remote(server_process)
+    # Print results for each config
+    for i, (config_path, result) in enumerate(zip(config_paths, all_results), 1):
+        print("\n" + "=" * 80)
+        print(f"RESULTS FOR {config_path}")
+        print("=" * 80)
+        print(json.dumps(result, indent=2))
+        print("=" * 80)
 
     # Print summary of all results
     print("\n\n" + "=" * 80)
@@ -567,9 +502,7 @@ def main(*args):
     print("=" * 80)
 
     all_passed = True
-    for item in all_results:
-        config_path = item["config_path"]
-        result = item["result"]
+    for config_path, result in zip(config_paths, all_results):
         status = result.get("status")
 
         if status == "passed":
