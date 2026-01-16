@@ -146,6 +146,7 @@ def run_benchmarks_with_server(model: str, tensor_parallel_size: int, config_jso
         "--disable-log-requests",
         "--enable-prefix-caching",
         "--enable-chunked-prefill",
+        "--disable-cascade-attn",
     ]
 
     print(f"Server command: {' '.join(cmd)}")
@@ -253,7 +254,6 @@ def run_benchmarks_with_server(model: str, tensor_parallel_size: int, config_jso
                     "--num-warmups",
                     str(config.get("num_warmups", 5)),
                     "--save-result",
-                    "--disable-cascade-attn",
                 ]
 
                 # Add dataset-specific arguments
