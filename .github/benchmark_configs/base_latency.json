@@ -5,7 +5,7 @@
   "dataset_name": "random",
   "extra_body": null,
   "num_prompts": 100,
-  "prompt_len": 512,
+  "prompt_len": 4096,
   "output_len": 128,
   "max_concurrency": 1,
   "request_rate": "inf",
