@@ -1,0 +1,16 @@
+{
+  "name": "ci_latency",
+  "description": "CI benchmark for latency - asserts TPOT < 10ms",
+  "model_name": "Qwen/Qwen3-8B",
+  "dataset_name": "random",
+  "extra_body": null,
+  "num_prompts": 100,
+  "prompt_len": 512,
+  "output_len": 128,
+  "max_concurrency": 50,
+  "request_rate": "inf",
+  "stream": false,
+  "num_warmups": 10,
+  "seed": 42,
+  "tensor_parallel_size": 1
+}
