@@ -47,6 +47,7 @@ from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_se
 from vllm.entrypoints.openai.engine.protocol import (
     CompletionRequest,
     CompletionResponse,
+    ErrorDebugInfo,
     ErrorInfo,
     ErrorResponse,
     ResponsesRequest,
@@ -865,17 +866,37 @@ def build_app(args: Namespace) -> FastAPI:
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException):
+        import traceback
+
+        debug_info = None
+        if envs.VLLM_PASSTHROUGH_ERRORS:
+            # Include stack trace for internal servers
+            stack_trace = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            # Also include the cause if available
+            if exc.__cause__:
+                stack_trace += "\nCaused by:\n" + "".join(
+                    traceback.format_exception(
+                        type(exc.__cause__), exc.__cause__, exc.__cause__.__traceback__
+                    )
+                )
+            debug_info = ErrorDebugInfo(stack_trace=stack_trace)
+
         err = ErrorResponse(
             error=ErrorInfo(
                 message=sanitize_message(exc.detail),
                 type=HTTPStatus(exc.status_code).phrase,
                 code=exc.status_code,
+                debug=debug_info,
             )
         )
         return JSONResponse(err.model_dump(), status_code=exc.status_code)
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(_: Request, exc: RequestValidationError):
+        import traceback
+
         param = None
         for error in exc.errors():
             if "ctx" in error and "error" in error["ctx"]:
@@ -892,12 +913,20 @@ def build_app(args: Namespace) -> FastAPI:
         else:
             message = exc_str
 
+        debug_info = None
+        if envs.VLLM_PASSTHROUGH_ERRORS:
+            stack_trace = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            debug_info = ErrorDebugInfo(stack_trace=stack_trace)
+
         err = ErrorResponse(
             error=ErrorInfo(
                 message=sanitize_message(message),
                 type=HTTPStatus.BAD_REQUEST.phrase,
                 code=HTTPStatus.BAD_REQUEST,
                 param=param,
+                debug=debug_info,
             )
         )
         return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)

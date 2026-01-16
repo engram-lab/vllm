@@ -364,6 +364,8 @@ class BackgroundResources:
     # Set if any of the engines are dead. Here so that the output
     # processing threads can access it without holding a ref to the client.
     engine_dead: bool = False
+    # Store the original error message when the engine dies
+    engine_dead_error: str | None = None
 
     def __call__(self):
         """Clean up background resources."""
@@ -423,9 +425,20 @@ class BackgroundResources:
                     shutdown_sender.send(b"")
 
     def validate_alive(self, frames: Sequence[zmq.Frame]):
-        if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
-            self.engine_dead = True
-            raise EngineDeadError()
+        if len(frames) == 1:
+            frame_data = bytes(frames[0].buffer)
+            if frame_data.startswith(EngineCoreProc.ENGINE_CORE_DEAD):
+                self.engine_dead = True
+                # Parse error message if present
+                # (format: ENGINE_CORE_DEAD:error_message)
+                error_msg = None
+                if b":" in frame_data:
+                    error_msg = frame_data.split(b":", 1)[1].decode(
+                        "utf-8", errors="replace"
+                    )
+                    # Store the error for later use
+                    self.engine_dead_error = error_msg
+                raise EngineDeadError(error_msg)
 
 
 class MPClient(EngineCoreClient):
@@ -561,13 +574,20 @@ class MPClient(EngineCoreClient):
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""
-        return (
-            EngineDeadError(suppress_context=True) if self.resources.engine_dead else e
-        )
+        if self.resources.engine_dead:
+            # Preserve the original exception message for debugging
+            error_msg = f"{type(e).__name__}: {e}" if str(e) else None
+            # Store for later use if not already set
+            if error_msg and not self.resources.engine_dead_error:
+                self.resources.engine_dead_error = error_msg
+            # Use stored error if available
+            final_msg = self.resources.engine_dead_error or error_msg
+            return EngineDeadError(final_msg, suppress_context=True)
+        return e
 
     def ensure_alive(self):
         if self.resources.engine_dead:
-            raise EngineDeadError()
+            raise EngineDeadError(self.resources.engine_dead_error)
 
     def add_pending_message(self, tracker: zmq.MessageTracker, msg: Any):
         if not tracker.done:
@@ -882,7 +902,7 @@ class AsyncMPClient(MPClient):
             except Exception as e:
                 outputs_queue.put_nowait(e)
             except asyncio.CancelledError:
-                outputs_queue.put_nowait(EngineDeadError())
+                outputs_queue.put_nowait(EngineDeadError(resources.engine_dead_error))
 
         resources.output_queue_task = asyncio.create_task(
             process_outputs_socket(), name="EngineCoreOutputQueueTask"

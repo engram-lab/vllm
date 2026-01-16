@@ -9,6 +9,7 @@ requires = [
     "torch == 2.9.1",
     "wheel",
     "jinja2",
+    "boto3",
     "grpcio-tools>=1.76.0",
 ]
 build-backend = "setuptools.build_meta"

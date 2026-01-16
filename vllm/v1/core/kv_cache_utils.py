@@ -508,12 +508,20 @@ def generate_block_hash_extra_keys(
     cache_salt_keys: list[str] = (
         [request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []
     )
+    # Include cartridge_id in ALL blocks (not just first) because cartridge
+    # shifts RoPE positions for all tokens. Requests with the same cartridge
+    # can share prefix cache; different cartridges will have different hashes.
+    cartridge_keys: list[str] = [request.cartridge_id] if request.cartridge_id else []
     prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
         request, start_token_idx, end_token_idx
     )
 
     extra_keys: list[Any] = (
-        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
+        lora_extra_keys
+        + mm_extra_keys
+        + cache_salt_keys
+        + cartridge_keys
+        + prompt_embeds_keys
     )
 
     if not extra_keys:
@@ -552,6 +560,16 @@ def hash_block_tokens(
     )
 
 
+def _generate_cartridge_virtual_tokens(
+    cartridge_id: str,
+    seq_len: int,
+    hash_fn,
+) -> list[int]:
+    """Generate deterministic virtual token IDs for cartridge prefix sharing."""
+    base_hash = int.from_bytes(hash_fn(cartridge_id)[:4], "big")
+    return [-(base_hash + i) for i in range(seq_len)]
+
+
 def get_request_block_hasher(
     block_size: int,
     caching_hash_fn: Callable[[Any], bytes],
@@ -561,10 +579,22 @@ def get_request_block_hasher(
     of a request."""
 
     def request_block_hasher(request: Request) -> list[BlockHash]:
-        start_token_idx = len(request.block_hashes) * block_size
-        num_tokens = request.num_tokens
+        # For cartridge requests, prepend virtual tokens for shared prefix caching.
+        cart_seq_len = getattr(request, "cartridge_seq_len", 0)
+        cart_id = getattr(request, "cartridge_id", None)
 
-        if start_token_idx + block_size > num_tokens:
+        if cart_seq_len > 0 and cart_id:
+            virtual_tokens = _generate_cartridge_virtual_tokens(
+                cart_id, cart_seq_len, caching_hash_fn
+            )
+            hash_token_ids = virtual_tokens + list(request.all_token_ids)
+        else:
+            hash_token_ids = list(request.all_token_ids)
+
+        total_tokens = request.num_tokens + cart_seq_len
+        start_token_idx = len(request.block_hashes) * block_size
+
+        if start_token_idx + block_size > total_tokens:
             # Early stop when there no new full blocks created.
             return []
 
@@ -582,17 +612,20 @@ def get_request_block_hasher(
         new_block_hashes: list[BlockHash] = []
         while True:
             end_token_idx = start_token_idx + block_size
-            if end_token_idx > num_tokens:
+            if end_token_idx > total_tokens:
                 # We only hash full blocks
                 break
 
             # MM and LoRA requests need extra keys for block-hash computation.
+            # Adjust indices for actual request tokens (after cartridge portion)
+            req_start = max(0, start_token_idx - cart_seq_len)
+            req_end = max(0, end_token_idx - cart_seq_len)
             extra_keys, curr_mm_idx = generate_block_hash_extra_keys(
-                request, start_token_idx, end_token_idx, curr_mm_idx
+                request, req_start, req_end, curr_mm_idx
             )
 
             # Compute the hash of the current block
-            block_tokens = request.all_token_ids[start_token_idx:end_token_idx]
+            block_tokens = hash_token_ids[start_token_idx:end_token_idx]
             block_hash = hash_block_tokens(
                 caching_hash_fn, prev_block_hash_value, block_tokens, extra_keys
             )

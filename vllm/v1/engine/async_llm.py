@@ -275,7 +275,7 @@ class AsyncLLM(EngineClient):
         """Add new request to the AsyncLLM."""
 
         if self.errored:
-            raise EngineDeadError()
+            raise EngineDeadError(self.engine_core.resources.engine_dead_error)
 
         is_pooling = isinstance(params, PoolingParams)
 
@@ -871,4 +871,4 @@ class AsyncLLM(EngineClient):
 
     @property
     def dead_error(self) -> BaseException:
-        return EngineDeadError()
+        return EngineDeadError(self.engine_core.resources.engine_dead_error)

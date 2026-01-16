@@ -117,11 +117,27 @@ class OpenAIBaseModel(BaseModel):
         return result
 
 
+class ErrorDebugInfo(OpenAIBaseModel):
+    """Debug info included when VLLM_PASSTHROUGH_ERRORS is enabled."""
+
+    request_id: str | None = None
+    stack_trace: str | None = None
+    # Request metadata (not full prompts/completions for security)
+    num_prompt_tokens: int | None = None
+    num_messages: int | None = None
+    model: str | None = None
+    adapter_ids: list[str] | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+
+
 class ErrorInfo(OpenAIBaseModel):
     message: str
     type: str
     param: str | None = None
     code: int
+    # Debug info only included when VLLM_PASSTHROUGH_ERRORS is enabled
+    debug: ErrorDebugInfo | None = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -508,6 +524,44 @@ class ResponsesRequest(OpenAIBaseModel):
         return data
 
 
+class AdapterSpec(OpenAIBaseModel):
+    """Base specification for an adapter (prefix, LoRA, currently supported)."""
+
+    id: str = Field(
+        description=(
+            "The identifier/path to the adapter. For S3 sources, this should be "
+            "an S3 URI (e.g., 's3://bucket/path/to/adapter'). "
+            "For local sources, this should be a file path."
+        ),
+    )
+    source: Literal["s3", "local"] = Field(
+        default="s3",
+        description=(
+            "The source type of the adapter. Supports: s3, local, wandb, huggingface"
+        ),
+    )
+    force_redownload: bool = Field(
+        default=False,
+        description=(
+            "If true, force redownload the adapter even if it exists in the cache. "
+            "If false, use cached version if available."
+        ),
+    )
+
+
+class AdaptersConfig(OpenAIBaseModel):
+    """Configuration for multiple adapter types in a request."""
+
+    prefix: list[AdapterSpec] | None = Field(
+        default=None,
+        description="List of prefix/cartridge adapters to load (learned KV cache)",
+    )
+    lora: list[AdapterSpec] | None = Field(
+        default=None,
+        description="List of LoRA adapters to load (low-rank weight deltas)",
+    )
+
+
 class CompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/completions/create
@@ -633,6 +687,14 @@ class CompletionRequest(OpenAIBaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
+    )
+
+    adapters: AdaptersConfig | None = Field(
+        default=None,
+        description=(
+            "Adapters configuration for this request. Supports prefix (KV cache) "
+            "and LoRA adapters that can be loaded from S3, local storage, etc."
+        ),
     )
 
     vllm_xargs: dict[str, str | int | float] | None = Field(
