@@ -1,0 +1,54 @@
+name: Cartridge Addition Eval
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Allow manual triggering
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cartridge-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      GPU_TYPE: "H200"
+      GPU_COUNT: "1"
+      BRANCH: ${{ github.head_ref || github.ref_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Modal CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install modal
+
+      - name: Run cartridge evaluation tests
+        run: |
+          modal run .github/scripts/modal_ci_pytest.py \
+            --test-path tests/test_cartridge_addition_eval.py \
+            --pytest-args "-v -x -m benchmark" \
+            --env-vars "VLLM_TEST_ENABLE_CARTRIDGE=1,VLLM_PASSTHROUGH_ERRORS=1"
+
+      - name: Report results
+        if: always()
+        run: |
+          echo "Cartridge evaluation completed (includes memory cleanup tests)"
+          echo "Check the logs above for results"
