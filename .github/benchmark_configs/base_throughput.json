@@ -1,0 +1,18 @@
+{
+  "name": "ci_throughput",
+  "description": "CI benchmark for throughput - asserts output throughput > 200 tok/s",
+  "model_name": "Qwen/Qwen3-8B",
+  "dataset_name": "random",
+  "extra_body": null,
+  "num_prompts": 250,
+  "prompt_len": 4096,
+  "output_len": 128,
+  "max_concurrency": 50,
+  "request_rate": "inf",
+  "stream": false,
+  "num_warmups": 10,
+  "seed": 42,
+  "tensor_parallel_size": 1,
+  "assert_type": "throughput",
+  "throughput_threshold_tok_s": 200.0
+}
