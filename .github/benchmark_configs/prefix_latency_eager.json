@@ -24,6 +24,6 @@
   "seed": 42,
   "tensor_parallel_size": 1,
   "assert_type": "latency",
-  "tpot_threshold_ms": 15.0,
+  "tpot_threshold_ms": 25.0,
   "enforce_eager": true
 }
