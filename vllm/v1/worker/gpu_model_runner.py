@@ -490,6 +490,11 @@ class GPUModelRunner(
         self.gpu_cartridge_cache: dict[
             str, list[tuple[torch.Tensor, torch.Tensor]]
         ] = {}
+        # Reference counting for cartridge GPU cache cleanup.
+        # Maps cartridge_id -> number of active requests using it.
+        self._cartridge_ref_counts: dict[str, int] = {}
+        # Maps request_id -> cartridge_id for cleanup when request finishes.
+        self._request_to_cartridge: dict[str, str] = {}
         # Debug counter for cartridge timing logs.
         self._cartridge_debug_count = 0
         self.comm_stream = torch.cuda.Stream()
@@ -947,9 +952,23 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
 
-        # Clear cartridge position offsets for finished requests.
+        # Clear cartridge state for finished requests.
+        # Decrement ref counts and free GPU cache when no longer used.
         for req_id in scheduler_output.finished_req_ids:
             self.cartridge_position_offsets.pop(req_id, None)
+            cartridge_id = self._request_to_cartridge.pop(req_id, None)
+            if cartridge_id is not None:
+                self._cartridge_ref_counts[cartridge_id] -= 1
+                if self._cartridge_ref_counts[cartridge_id] <= 0:
+                    # No more requests using this cartridge - free GPU memory
+                    del self._cartridge_ref_counts[cartridge_id]
+                    if cartridge_id in self.gpu_cartridge_cache:
+                        del self.gpu_cartridge_cache[cartridge_id]
+                        if _CARTRIDGE_DEBUG_TIMING:
+                            logger.info(
+                                "[cartridge-cleanup] Freed GPU cache for %s",
+                                cartridge_id,
+                            )
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -1161,6 +1180,12 @@ class GPUModelRunner(
                 # Store position offset:
                 # input tokens need positions/slots offset by cart_seq_len
                 self.cartridge_position_offsets[req_id] = cart_seq_len
+
+                # Track reference count for GPU cache cleanup.
+                self._request_to_cartridge[req_id] = cartridge_id
+                self._cartridge_ref_counts[cartridge_id] = (
+                    self._cartridge_ref_counts.get(cartridge_id, 0) + 1
+                )
 
                 if _CARTRIDGE_DEBUG_TIMING:
                     self._cartridge_debug_count += 1
@@ -2102,6 +2127,23 @@ class GPUModelRunner(
             [] for _ in range(num_kv_cache_groups)
         ]
 
+        # For cartridge requests, num_computed_tokens doesn't include the
+        # cartridge tokens (which are pre-populated into the cache, not
+        # computed). However, num_common_prefix_blocks DOES include cartridge
+        # blocks (for prefix sharing). We need to adjust num_computed_tokens
+        # to include cartridge offsets so that common_prefix_len is computed
+        # consistently with how the block table and seq_lens are set up.
+        adjusted_num_computed_tokens = num_computed_tokens
+        if self.cartridge_position_offsets:
+            num_reqs = len(num_computed_tokens)
+            adjusted_num_computed_tokens = num_computed_tokens.copy()
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                if req_id in self.cartridge_position_offsets:
+                    adjusted_num_computed_tokens[req_idx] += (
+                        self.cartridge_position_offsets[req_id]
+                    )
+
         for kv_cache_gid in range(num_kv_cache_groups):
             for attn_group in self.attn_groups[kv_cache_gid]:
                 if isinstance(attn_group.kv_cache_spec, EncoderOnlyAttentionSpec):
@@ -2110,7 +2152,7 @@ class GPUModelRunner(
                     # 0 if cascade attention should not be used
                     cascade_attn_prefix_len = self._compute_cascade_attn_prefix_len(
                         num_scheduled_tokens,
-                        num_computed_tokens,
+                        adjusted_num_computed_tokens,
                         num_common_prefix_blocks[kv_cache_gid],
                         attn_group.kv_cache_spec,
                         attn_group.get_metadata_builder(),

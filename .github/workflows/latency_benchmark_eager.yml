@@ -1,12 +1,10 @@
-name: Throughput Benchmark
+name: Latency Benchmark (Eager)
 
 on:
   push:
     branches: [main]
   pull_request:
-    types: [ready_for_review, opened, reopened]
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:  # Allow manual triggering
 
 concurrency:
@@ -17,16 +15,16 @@ permissions:
   contents: read
 
 jobs:
-  throughput-benchmark:
+  latency-benchmark-eager:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-      GPU_TYPE: "A100"
+      GPU_TYPE: "H200"
       GPU_COUNT: "1"
-      THROUGHPUT_THRESHOLD_TOK_S: "1500.0"
+      TPOT_THRESHOLD_MS: "10.0"
 
     steps:
       - name: Checkout code
@@ -42,14 +40,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install modal
 
-      - name: Run throughput benchmark
+      - name: Run latency benchmark (eager)
         run: |
           modal run .github/scripts/modal_ci_benchmark.py \
-            --config-paths .github/benchmark_configs/base_throughput.json \
-            --config-paths .github/benchmark_configs/prefix_throughput.json
+            --config-paths .github/benchmark_configs/base_latency_eager.json \
+            --config-paths .github/benchmark_configs/prefix_latency_eager.json
 
       - name: Report results
         if: always()
         run: |
-          echo "Throughput benchmark completed"
+          echo "Latency benchmark (eager) completed"
           echo "Check the logs above for results"

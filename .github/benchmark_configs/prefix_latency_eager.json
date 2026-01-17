@@ -1,6 +1,6 @@
 {
-  "name": "prefix_throughput",
-  "description": "CI benchmark for throughput with cartridge prefix - asserts output throughput > 100 tok/s",
+  "name": "ci_latency_eager",
+  "description": "CI benchmark for eager latency - asserts TPOT < 10ms",
   "model_name": "Qwen/Qwen3-8B",
   "dataset_name": "random",
   "extra_body": {
@@ -14,15 +14,16 @@
       ]
     }
   },
-  "num_prompts": 250,
+  "num_prompts": 25,
   "prompt_len": 1,
   "output_len": 128,
-  "max_concurrency": 50,
+  "max_concurrency": 1,
   "request_rate": "inf",
   "stream": false,
   "num_warmups": 10,
   "seed": 42,
   "tensor_parallel_size": 1,
-  "assert_type": "throughput",
-  "throughput_threshold_tok_s": 100.0
+  "assert_type": "latency",
+  "tpot_threshold_ms": 15.0,
+  "enforce_eager": true
 }

@@ -1,12 +1,10 @@
-name: Latency Benchmark
+name: Cartridge Addition Eval
 
 on:
   push:
     branches: [main]
   pull_request:
-    types: [ready_for_review, opened, reopened]
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:  # Allow manual triggering
 
 concurrency:
@@ -17,16 +15,16 @@ permissions:
   contents: read
 
 jobs:
-  latency-benchmark:
+  cartridge-eval:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-      GPU_TYPE: "A100"
+      GPU_TYPE: "H200"
       GPU_COUNT: "1"
-      TPOT_THRESHOLD_MS: "15.0"
+      BRANCH: ${{ github.head_ref || github.ref_name }}
 
     steps:
       - name: Checkout code
@@ -42,14 +40,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install modal
 
-      - name: Run latency benchmark
+      - name: Run cartridge evaluation tests
         run: |
-          modal run .github/scripts/modal_ci_benchmark.py \
-            --config-paths .github/benchmark_configs/base_latency.json \
-            --config-paths .github/benchmark_configs/prefix_latency.json
+          modal run .github/scripts/modal_ci_pytest.py \
+            --test-path tests/test_cartridge_addition_eval.py \
+            --pytest-args "-v -x -m benchmark" \
+            --env-vars "VLLM_TEST_ENABLE_CARTRIDGE=1,VLLM_PASSTHROUGH_ERRORS=1"
 
       - name: Report results
         if: always()
         run: |
-          echo "Latency benchmark completed"
+          echo "Cartridge evaluation completed (includes memory cleanup tests)"
           echo "Check the logs above for results"
