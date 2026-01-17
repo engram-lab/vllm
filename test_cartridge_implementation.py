@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Test script for KV cache cartridge implementation."""
 
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -9,7 +10,7 @@ from pathlib import Path
 import torch
 
 # Add vllm to path
-sys.path.insert(0, '/home/user/vllm')
+sys.path.insert(0, "/home/user/vllm")
 
 
 def test_cartridge_creation_and_loading():
@@ -25,11 +26,11 @@ def test_cartridge_creation_and_loading():
         # Create test cartridge
         test_token_ids = [101, 2023, 2003, 1037, 3231, 102]
         cartridge_data = {
-            'token_ids': test_token_ids,
-            'metadata': {
-                'model': 'test-model',
-                'description': 'Test cartridge',
-            }
+            "token_ids": test_token_ids,
+            "metadata": {
+                "model": "test-model",
+                "description": "Test cartridge",
+            },
         }
 
         print(f"\n✓ Creating cartridge at: {cartridge_path}")
@@ -44,18 +45,17 @@ def test_cartridge_creation_and_loading():
 
         # Load the adapter (cartridge)
         loaded_data = manager.get_adapter(
-            adapter_id=str(cartridge_path),
-            force_redownload=False
+            adapter_id=str(cartridge_path), force_redownload=False
         )
 
-        print(f"\n✓ Loaded cartridge successfully")
+        print("\n✓ Loaded cartridge successfully")
         print(f"  Type: {type(loaded_data)}")
         print(f"  Keys: {loaded_data.keys()}")
         print(f"  Token IDs: {loaded_data['token_ids']}")
 
         # Verify data
-        assert 'token_ids' in loaded_data
-        assert len(loaded_data['token_ids']) == len(test_token_ids)
+        assert "token_ids" in loaded_data
+        assert len(loaded_data["token_ids"]) == len(test_token_ids)
         print("\n✓ Verification passed!")
 
     return True
@@ -67,25 +67,21 @@ def test_cartridge_loader():
     print("Test 2: CartridgeData and Loader")
     print("=" * 60)
 
-    from vllm.v1.cartridge_loader import CartridgeData, load_cartridge
+    from vllm.v1.cartridge_loader import load_cartridge
 
     # Create a temporary cartridge
     with tempfile.TemporaryDirectory() as tmpdir:
         cartridge_path = Path(tmpdir) / "test_cartridge2.pt"
 
         test_token_ids = [1, 2, 3, 4, 5]
-        cartridge_data = {
-            'token_ids': test_token_ids,
-            'metadata': {'test': 'data'}
-        }
+        cartridge_data = {"token_ids": test_token_ids, "metadata": {"test": "data"}}
 
         print(f"\n✓ Creating cartridge at: {cartridge_path}")
         torch.save(cartridge_data, cartridge_path)
 
         # Load using cartridge_loader
         loaded_cartridge = load_cartridge(
-            cartridge_id=str(cartridge_path),
-            force_redownload=False
+            cartridge_id=str(cartridge_path), force_redownload=False
         )
 
         print(f"\n✓ Loaded CartridgeData: {loaded_cartridge}")
@@ -114,30 +110,25 @@ def test_cartridge_with_list_tokens():
         cartridge1_path = Path(tmpdir) / "cartridge1.pt"
         cartridge2_path = Path(tmpdir) / "cartridge2.pt"
 
-        torch.save({'token_ids': [1, 2, 3]}, cartridge1_path)
-        torch.save({'token_ids': [4, 5, 6]}, cartridge2_path)
+        torch.save({"token_ids": [1, 2, 3]}, cartridge1_path)
+        torch.save({"token_ids": [4, 5, 6]}, cartridge2_path)
 
-        print(f"\n✓ Created 2 cartridges")
+        print("\n✓ Created 2 cartridges")
 
         # Load multiple cartridges
         cartridges_spec = [
-            {
-                'id': str(cartridge1_path),
-                'source': 'local',
-                'force_redownload': False
-            },
-            {
-                'id': str(cartridge2_path),
-                'source': 'local',
-                'force_redownload': False
-            }
+            {"id": str(cartridge1_path), "source": "local", "force_redownload": False},
+            {"id": str(cartridge2_path), "source": "local", "force_redownload": False},
         ]
 
         loaded_cartridges = load_cartridges_from_request(cartridges_spec)
 
         print(f"\n✓ Loaded {len(loaded_cartridges)} cartridges")
         for i, cart in enumerate(loaded_cartridges):
-            print(f"  Cartridge {i+1}: {cart.num_tokens} tokens - {cart.token_ids.tolist()}")
+            print(
+                f"  Cartridge {i + 1}: {cart.num_tokens} tokens - "
+                f"{cart.token_ids.tolist()}"
+            )
 
         # Verify
         assert len(loaded_cartridges) == 2
@@ -161,20 +152,20 @@ def test_caching_behavior():
         cartridge_path = Path(tmpdir) / "test.pt"
 
         # Create cartridge
-        torch.save({'token_ids': [1, 2, 3]}, cartridge_path)
+        torch.save({"token_ids": [1, 2, 3]}, cartridge_path)
 
         manager = AdapterManager(cache_dir=str(cache_dir))
 
         # First load - should copy to cache for local files
-        print(f"\n✓ First load (should read from source)")
+        print("\n✓ First load (should read from source)")
         data1 = manager.get_adapter(str(cartridge_path))
 
         # Second load - should use same file for local
-        print(f"✓ Second load (local files are not cached, read directly)")
+        print("✓ Second load (local files are not cached, read directly)")
         data2 = manager.get_adapter(str(cartridge_path))
 
         # Both should have same content
-        assert data1['token_ids'].tolist() == data2['token_ids'].tolist()
+        assert data1["token_ids"].tolist() == data2["token_ids"].tolist()
         print("\n✓ Verification passed!")
 
     return True
@@ -187,32 +178,24 @@ def test_protocol_models():
     print("=" * 60)
 
     from vllm.entrypoints.openai.protocol import (
-        KVCacheCartridge,
         ChatCompletionRequest,
         CompletionRequest,
+        KVCacheCartridge,
     )
 
     # Test KVCacheCartridge
     print("\n✓ Testing KVCacheCartridge model")
-    cartridge = KVCacheCartridge(
-        id="s3://bucket/path.pt",
-        force_redownload=True
-    )
+    cartridge = KVCacheCartridge(id="s3://bucket/path.pt", force_redownload=True)
     print(f"  Cartridge: {cartridge}")
     assert cartridge.id == "s3://bucket/path.pt"
-    assert cartridge.force_redownload == True
+    assert cartridge.force_redownload is True
 
     # Test ChatCompletionRequest with cartridges
     print("\n✓ Testing ChatCompletionRequest with cartridges")
     request = ChatCompletionRequest(
         messages=[{"role": "user", "content": "Hello"}],
         model="test-model",
-        cartridges=[
-            KVCacheCartridge(
-                id="s3://bucket/test.pt",
-                force_redownload=False
-            )
-        ]
+        cartridges=[KVCacheCartridge(id="s3://bucket/test.pt", force_redownload=False)],
     )
     print(f"  Request has {len(request.cartridges)} cartridge(s)")
     assert len(request.cartridges) == 1
@@ -222,9 +205,7 @@ def test_protocol_models():
     comp_request = CompletionRequest(
         prompt="Test prompt",
         model="test-model",
-        cartridges=[
-            KVCacheCartridge(id="local/path.pt")
-        ]
+        cartridges=[KVCacheCartridge(id="local/path.pt")],
     )
     assert len(comp_request.cartridges) == 1
 
@@ -244,15 +225,11 @@ def test_process_cartridges_integration():
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create test cartridge
         cartridge_path = Path(tmpdir) / "test.pt"
-        torch.save({'token_ids': [100, 200, 300]}, cartridge_path)
+        torch.save({"token_ids": [100, 200, 300]}, cartridge_path)
 
         # Simulate cartridges spec
         cartridges_spec = [
-            {
-                'id': str(cartridge_path),
-                'source': 'local',
-                'force_redownload': False
-            }
+            {"id": str(cartridge_path), "source": "local", "force_redownload": False}
         ]
 
         # Load cartridges
@@ -300,6 +277,7 @@ def main():
         except Exception as e:
             print(f"\n✗ Test failed with error: {e}")
             import traceback
+
             traceback.print_exc()
             results.append((test_name, "FAILED"))
 

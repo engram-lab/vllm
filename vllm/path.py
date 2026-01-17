@@ -1,4 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # From elements -- refactor into shared engrams lib later
+import contextlib
 import fnmatch
 import glob as globlib
 import io
@@ -85,7 +88,7 @@ class Path:
         raise NotImplementedError
 
     def read(self, mode="r"):
-        assert mode in "r rb".split(), mode
+        assert mode in ["r", "rb"], mode
         with self.open(mode) as f:
             return f.read()
 
@@ -96,7 +99,7 @@ class Path:
         return self.read(mode="rb")
 
     def write(self, content, mode="w"):
-        assert mode in "w a wb ab".split(), mode
+        assert mode in ["w", "a", "wb", "ab"], mode
         with self.open(mode) as f:
             f.write(content)
 
@@ -385,7 +388,7 @@ class GCSPath(Path):
             raise NotImplementedError(mode)
 
     def write(self, content, mode="w"):
-        assert mode in "w a wb ab".split(), mode
+        assert mode in ["w", "a", "wb", "ab"], mode
         if mode == "a":
             prefix = self.read("r")
             content = prefix + content
@@ -634,10 +637,8 @@ class GCSAppendFile:
         self._wait_until_exists(self.target)
         self._wait_until_exists(self.temp)
         self.target.compose([self.target, self.temp], **gcs_retry())
-        try:
+        with contextlib.suppress(google.cloud.exceptions.NotFound):
             self.temp.delete(**gcs_retry())
-        except google.cloud.exceptions.NotFound:
-            pass
 
     def _wait_until_exists(self, blob, timeout=60):
         start = time.time()
@@ -760,7 +761,7 @@ class S3Path(Path):
             raise NotImplementedError(mode)
 
     def write(self, content, mode="w"):
-        assert mode in "w a wb ab".split(), mode
+        assert mode in ["w", "a", "wb", "ab"], mode
         assert self.bucket_name
         assert self.key
         if mode in ("a", "ab"):
@@ -814,9 +815,10 @@ class S3Path(Path):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     relative = key[len(prefix) :] if prefix else key
-                    if "/" not in relative.rstrip("/") or pattern.count("/") > 0:
-                        if fnmatch.fnmatch(relative, pattern):
-                            results.append(key)
+                    if (
+                        "/" not in relative.rstrip("/") or pattern.count("/") > 0
+                    ) and fnmatch.fnmatch(relative, pattern):
+                        results.append(key)
 
         results = sorted(set(results))
         return [type(self)(f"s3://{self.bucket_name}/{key}") for key in results]
@@ -1083,9 +1085,11 @@ def _copy_across_filesystems(source, dest, recursive):
     assert isinstance(dest, Path), type(dest)
     if not recursive:
         assert source.isfile()
-        # Fast path: S3 -> local using boto3 transfer manager (multi-part parallel download)
+        # Fast path: S3 -> local using boto3 transfer manager
+        # (multi-part parallel download)
         if isinstance(source, S3Path) and isinstance(dest, LocalPath):
             from boto3.s3.transfer import TransferConfig
+
             config = TransferConfig(
                 multipart_threshold=8 * 1024 * 1024,
                 max_concurrency=10,
@@ -1097,9 +1101,8 @@ def _copy_across_filesystems(source, dest, recursive):
             )
             return
         # Stream the file to avoid loading large files into memory
-        with source.open("rb") as src:
-            with dest.open("wb") as dst:
-                shutil.copyfileobj(src, dst)
+        with source.open("rb") as src, dest.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
         return
     if dest.exists():
         dest = dest / source.name
@@ -1112,9 +1115,8 @@ def _copy_across_filesystems(source, dest, recursive):
             d.mkdir()
         else:
             # Stream each file to avoid memory issues
-            with s.open("rb") as src:
-                with d.open("wb") as dst:
-                    shutil.copyfileobj(src, dst)
+            with s.open("rb") as src, d.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
 
 
 Path.filesystems = [

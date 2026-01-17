@@ -16,7 +16,7 @@ Cartridges support two use cases:
 """
 
 import re
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -26,7 +26,7 @@ from vllm.utils.adapter_manager import get_adapter_manager
 logger = init_logger(__name__)
 
 # Compiled pattern for matching KV cache layer keys
-_KV_LAYER_PATTERN = re.compile(r'layers\.(\d+)\.attention\.prefix\.(keys|values)')
+_KV_LAYER_PATTERN = re.compile(r"layers\.(\d+)\.attention\.prefix\.(keys|values)")
 
 # Global cache for active cartridge KV tensors
 # Maps request_id -> {layer_idx: (key_tensor, value_tensor)}
@@ -42,37 +42,38 @@ def _parse_kv_cache_to_layers(
     device: torch.device | str | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
     """Parse KV cache dict into keys_by_layer and values_by_layer.
-    
+
     Input: (1, seq_len, num_kv_heads, head_dim)
     Output: (num_kv_heads, seq_len, head_dim)
     """
     keys_by_layer: dict[int, torch.Tensor] = {}
     values_by_layer: dict[int, torch.Tensor] = {}
-    
+
     for key_name, tensor in kv_cache.items():
         match = _KV_LAYER_PATTERN.match(key_name)
         if not match:
             continue
-        
+
         layer_idx = int(match.group(1))
         kv_type = match.group(2)
-        
-        # Transform: (1, seq_len, num_kv_heads, head_dim) -> (num_kv_heads, seq_len, head_dim)
+
+        # Transform: (1, seq_len, num_kv_heads, head_dim) ->
+        # (num_kv_heads, seq_len, head_dim)
         if tensor.dim() != 4:
             raise ValueError(
                 f"Invalid cartridge format: {key_name} should be 4D "
                 f"(1, seq_len, num_kv_heads, head_dim), got {tensor.shape}"
             )
         tensor = tensor.squeeze(0).permute(1, 0, 2)
-        
+
         if device is not None:
             tensor = tensor.to(device)
-        
-        if kv_type == 'keys':
+
+        if kv_type == "keys":
             keys_by_layer[layer_idx] = tensor
         else:
             values_by_layer[layer_idx] = tensor
-    
+
     return keys_by_layer, values_by_layer
 
 
@@ -84,21 +85,25 @@ def set_active_cartridge_kv(
     """Set the active cartridge KV for a request."""
     if not cartridge_data.is_learned or not cartridge_data.kv_cache:
         return
-    
+
     keys_by_layer, values_by_layer = _parse_kv_cache_to_layers(
         cartridge_data.kv_cache, device
     )
-    
+
     # Combine into layer_kv dict (only layers with both keys and values)
     layer_kv = {
         idx: (keys_by_layer[idx], values_by_layer[idx])
         for idx in keys_by_layer
         if idx in values_by_layer
     }
-    
+
     if layer_kv:
         _active_cartridge_kv[request_id] = layer_kv
-        logger.info(f"Set cartridge KV for request {request_id}: {len(layer_kv)} layers")
+        logger.info(
+            "Set cartridge KV for request %s: %d layers",
+            request_id,
+            len(layer_kv),
+        )
 
 
 def get_active_cartridge_kv(
@@ -117,7 +122,7 @@ def clear_active_cartridge_kv(request_id: str) -> None:
     """Clear the cartridge KV for a finished request."""
     if request_id in _active_cartridge_kv:
         del _active_cartridge_kv[request_id]
-        logger.debug(f"Cleared cartridge KV for request {request_id}")
+        logger.debug("Cleared cartridge KV for request %s", request_id)
 
 
 def clear_cartridge_data_cache() -> None:
@@ -130,7 +135,7 @@ class CartridgeData:
     """Container for loaded cartridge data.
 
     Supported formats:
-    
+
     1. Standard format (pre-computed KV cache):
        {'token_ids': Tensor, 'kv_cache': dict, 'metadata': dict}
 
@@ -141,16 +146,16 @@ class CartridgeData:
 
     def __init__(
         self,
-        kv_cache: Optional[dict[str, torch.Tensor]] = None,
-        token_ids: Optional[torch.Tensor | list[int]] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        kv_cache: dict[str, torch.Tensor] | None = None,
+        token_ids: torch.Tensor | list[int] | None = None,
+        metadata: dict[str, Any] | None = None,
         is_learned: bool = False,
     ):
         self.is_learned = is_learned
         self.kv_cache = kv_cache or {}
         self.metadata = metadata or {}
         self._stacked_kv: list[torch.Tensor] | None = None
-        
+
         # Normalize token_ids to tensor
         if token_ids is None:
             self.token_ids = torch.tensor([], dtype=torch.long)
@@ -162,53 +167,57 @@ class CartridgeData:
                 else token_ids
             )
             self.num_tokens = len(self.token_ids)
-    
+
     def _infer_num_tokens_from_kv_cache(self) -> int:
-        """Infer seq_len from KV cache. Expected shape: (1, seq_len, num_kv_heads, head_dim)."""
+        """Infer seq_len from KV cache.
+
+        Expected shape: (1, seq_len, num_kv_heads, head_dim).
+        """
         if not self.kv_cache:
             return 0
         tensor = next(iter(self.kv_cache.values()))
         if tensor.dim() != 4:
             raise ValueError(
-                f"Invalid cartridge format: expected 4D tensor, got {tensor.dim()}D: {tensor.shape}"
+                f"Invalid cartridge format: expected 4D tensor, "
+                f"got {tensor.dim()}D: {tensor.shape}"
             )
         return tensor.shape[1]
-    
+
     def has_valid_token_ids(self) -> bool:
         """Check if this cartridge has valid token IDs for prepending."""
         return len(self.token_ids) > 0 and not self.is_learned
 
     def get_stacked_kv(self) -> list[torch.Tensor] | None:
         """Get stacked KV tensors for IPC, computing and caching on first call.
-        
+
         Output: [stacked_keys, stacked_values] with shape
             (num_layers, num_kv_heads, seq_len, head_dim)
         """
         if not self.is_learned or not self.kv_cache:
             return None
-        
+
         if self._stacked_kv is not None:
             return self._stacked_kv
-        
+
         keys_by_layer, values_by_layer = _parse_kv_cache_to_layers(self.kv_cache)
-        
+
         if keys_by_layer and values_by_layer:
             num_layers = max(keys_by_layer.keys()) + 1
             self._stacked_kv = [
                 torch.stack([keys_by_layer[i] for i in range(num_layers)]),
                 torch.stack([values_by_layer[i] for i in range(num_layers)]),
             ]
-            logger.info(f"Computed stacked cartridge KV: {num_layers} layers")
-        
+            logger.info("Computed stacked cartridge KV: %d layers", num_layers)
+
         return self._stacked_kv
 
     @classmethod
     def from_dict(cls, data: dict) -> "CartridgeData":
         """Load CartridgeData from a dictionary."""
         has_flat_kv = any(_KV_LAYER_PATTERN.match(k) for k in data)
-        has_trainable_kv = 'trainable_keys' in data or 'frozen_keys' in data
+        has_trainable_kv = "trainable_keys" in data or "frozen_keys" in data
         is_learned = has_flat_kv or has_trainable_kv
-        
+
         if not is_learned:
             # Standard format requires token_ids
             token_ids = data.get("token_ids")
@@ -223,81 +232,84 @@ class CartridgeData:
                 metadata=data.get("metadata") or {},
                 is_learned=False,
             )
-        
+
         # Learned cartridge
         kv_cache = cls._extract_learned_kv_cache(data, has_trainable_kv)
         metadata = data.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {}
-        metadata['_cartridge_type'] = 'learned'
-        
-        logger.info(f"Loaded learned cartridge with {len(kv_cache)} KV cache tensors.")
-        
+        metadata["_cartridge_type"] = "learned"
+
+        logger.info(
+            "Loaded learned cartridge with %d KV cache tensors.", len(kv_cache)
+        )
+
         return cls(
             kv_cache=kv_cache,
             token_ids=data.get("token_ids"),
             metadata=metadata,
             is_learned=True,
         )
-    
+
     @classmethod
     def _extract_learned_kv_cache(
         cls, data: dict, has_trainable_kv: bool
     ) -> dict[str, torch.Tensor]:
         """Extract KV cache from learned cartridge data.
-        
+
         Expected format from torchtitan prefix adapters:
-        - Keys like: "layers.{N}.attention.prefix.keys", "layers.{N}.attention.prefix.values"
+        - Keys: "layers.{N}.attention.prefix.keys/values"
         - Shape: (1, seq_len, num_kv_heads, head_dim)
-        
+
         Raises ValueError if the format doesn't match expectations.
         """
         if not has_trainable_kv:
             # Flat layer format (from torchtitan prefix adapters)
             kv_cache = {k: v for k, v in data.items() if _KV_LAYER_PATTERN.match(k)}
-            
+
             # Validate the format
             if kv_cache:
                 cls._validate_kv_cache_format(kv_cache)
             else:
                 # Log unexpected keys for debugging
-                unexpected_keys = [k for k in data.keys() if not k.startswith("_")]
+                unexpected_keys = [k for k in data if not k.startswith("_")]
                 if unexpected_keys:
                     logger.warning(
-                        f"Cartridge has no recognized KV cache keys. Found: {unexpected_keys[:10]}"
+                        "Cartridge has no recognized KV cache keys. Found: %s",
+                        unexpected_keys[:10],
                     )
-            
+
             return kv_cache
-        
+
         # TrainableCache format: convert to flat layer format
-        all_keys = data.get('trainable_keys') or data.get('frozen_keys', [])
-        all_values = data.get('trainable_values') or data.get('frozen_values', [])
-        
+        all_keys = data.get("trainable_keys") or data.get("frozen_keys", [])
+        all_values = data.get("trainable_values") or data.get("frozen_values", [])
+
         kv_cache = {}
         for layer_idx, (k, v) in enumerate(zip(all_keys, all_values)):
             if k is not None:
-                kv_cache[f'layers.{layer_idx}.attention.prefix.keys'] = k
+                kv_cache[f"layers.{layer_idx}.attention.prefix.keys"] = k
             if v is not None:
-                kv_cache[f'layers.{layer_idx}.attention.prefix.values'] = v
-        
+                kv_cache[f"layers.{layer_idx}.attention.prefix.values"] = v
+
         if kv_cache:
             cls._validate_kv_cache_format(kv_cache)
-        
+
         return kv_cache
-    
+
     @classmethod
     def _validate_kv_cache_format(cls, kv_cache: dict[str, torch.Tensor]) -> None:
         """Validate KV cache format from torchtitan prefix adapters.
-        
+
         Expected shape: (1, seq_len, num_kv_heads, head_dim)
         All tensors must have identical shape (same seq_len, num_kv_heads, head_dim).
         """
         if not kv_cache:
             return
-        
+
         first_key = next(iter(kv_cache))
         first_tensor = kv_cache[first_key]
-        
+
         if first_tensor.dim() != 4:
             raise ValueError(
                 f"Invalid cartridge format: expected 4D tensor "
@@ -309,19 +321,26 @@ class CartridgeData:
                 f"Invalid cartridge format: expected batch dim = 1, "
                 f"got {first_tensor.shape[0]}"
             )
-        
+
         expected_shape = first_tensor.shape
         for key, tensor in kv_cache.items():
             if tensor.shape != expected_shape:
                 raise ValueError(
                     f"Cartridge shape mismatch: {key} has {tensor.shape}, "
                     f"expected {expected_shape}"
-            )
-        
-        seq_len, num_kv_heads, head_dim = expected_shape[1], expected_shape[2], expected_shape[3]
+                )
+
+        seq_len, num_kv_heads, head_dim = (
+            expected_shape[1],
+            expected_shape[2],
+            expected_shape[3],
+        )
         logger.info(
-            f"Loaded cartridge: {len(kv_cache)} tensors, "
-            f"seq_len={seq_len}, num_kv_heads={num_kv_heads}, head_dim={head_dim}"
+            "Loaded cartridge: %d tensors, seq_len=%d, num_kv_heads=%d, head_dim=%d",
+            len(kv_cache),
+            seq_len,
+            num_kv_heads,
+            head_dim,
         )
 
     def __repr__(self) -> str:
@@ -353,12 +372,12 @@ def load_cartridge(
         CartridgeData containing the loaded cartridge
     """
     cache_key = cartridge_id
-    
+
     if not force_redownload and cache_key in _cartridge_data_cache:
-        logger.debug(f"Using cached CartridgeData for: {cartridge_id}")
+        logger.debug("Using cached CartridgeData for: %s", cartridge_id)
         return _cartridge_data_cache[cache_key]
-    
-    logger.info(f"Loading cartridge: {cartridge_id}")
+
+    logger.info("Loading cartridge: %s", cartridge_id)
 
     manager = get_adapter_manager()
     cartridge_tensor = manager.get_adapter(
@@ -372,8 +391,8 @@ def load_cartridge(
         )
 
     cartridge_data = CartridgeData.from_dict(cartridge_tensor)
-    logger.info(f"Successfully loaded cartridge: {cartridge_data}")
-    
+    logger.info("Successfully loaded cartridge: %s", cartridge_data)
+
     _cartridge_data_cache[cache_key] = cartridge_data
     return cartridge_data
 
@@ -387,7 +406,7 @@ def load_cartridges_from_request(
     for spec in cartridges_spec:
         cartridge_id = spec.get("id")
         if not cartridge_id:
-            logger.warning(f"Skipping cartridge with missing id: {spec}")
+            logger.warning("Skipping cartridge with missing id: %s", spec)
             continue
 
         try:
@@ -397,7 +416,7 @@ def load_cartridges_from_request(
             )
             loaded_cartridges.append(cartridge_data)
         except Exception as e:
-            logger.error(f"Failed to load cartridge {cartridge_id}: {e}")
+            logger.error("Failed to load cartridge %s: %s", cartridge_id, e)
             raise RuntimeError(f"Failed to load cartridge {cartridge_id}: {e}") from e
 
     return loaded_cartridges

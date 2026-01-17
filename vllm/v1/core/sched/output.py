@@ -46,10 +46,15 @@ class NewRequestData:
     prefill_token_ids: list[int] | None = None
 
     # Learned cartridge KV for injection into attention.
-    # Format: [stacked_keys, stacked_values] where each is (num_layers, num_heads, seq_len, head_dim)
+    # Format: [stacked_keys, stacked_values] where each is
+    # (num_layers, num_heads, seq_len, head_dim)
     cartridge_kv: "list[torch.Tensor] | None" = None
     # Cartridge identifier for deduplication across IPC
     cartridge_id: str | None = None
+    # Whether the cartridge prefix blocks were found in prefix cache.
+    cartridge_cache_hit: bool = False
+    # Cartridge sequence length (for cache-hit path without KV tensors).
+    cartridge_seq_len: int = 0
 
     @classmethod
     def from_request(
@@ -57,7 +62,13 @@ class NewRequestData:
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        cartridge_cache_hit: bool = False,
     ) -> "NewRequestData":
+        # When cartridge_cache_hit is True, don't send cartridge_kv via IPC.
+        # The worker already has the tensors cached in gpu_cartridge_cache,
+        # and the KV block cache already has the cartridge blocks populated.
+        # This avoids serializing large tensors (~100s of MB) for every request.
+        cartridge_kv = None if cartridge_cache_hit else request.cartridge_kv
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -69,8 +80,10 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
-            cartridge_kv=request.cartridge_kv,
+            cartridge_kv=cartridge_kv,
             cartridge_id=request.cartridge_id,
+            cartridge_cache_hit=cartridge_cache_hit,
+            cartridge_seq_len=getattr(request, "cartridge_seq_len", 0),
         )
 
     def __repr__(self) -> str:
@@ -87,6 +100,7 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
+            f"cartridge_cache_hit={self.cartridge_cache_hit},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
         )
@@ -112,6 +126,7 @@ class NewRequestData:
             f"block_ids={self.block_ids},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
+            f"cartridge_cache_hit={self.cartridge_cache_hit},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
             ")"
         )

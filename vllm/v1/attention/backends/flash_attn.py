@@ -577,9 +577,10 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.supports_quant_query_input = True
 
-    # NOTE: Cartridge KV is now pre-populated into the cache during request initialization
-    # in gpu_model_runner._update_states(). The positions and seq_lens are already adjusted
-    # to account for the cartridge, so attention just works normally without special handling.
+    # NOTE: Cartridge KV is now pre-populated into the cache during
+    # request initialization in gpu_model_runner._update_states().
+    # The positions and seq_lens are already adjusted to account for
+    # the cartridge, so attention just works normally.
 
     def forward(
         self,
