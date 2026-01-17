@@ -58,7 +58,7 @@ image = (
     .run_commands(
         f"git clone https://$GITHUB_TOKEN@github.com/engram-lab/vllm.git -b {BRANCH} /tmp/vllm",
         secrets=[secrets],
-        force_build=False,
+        force_build=True,
     )
     .uv_pip_install(
         "vllm @ file:///tmp/vllm",
