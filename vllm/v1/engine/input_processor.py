@@ -460,6 +460,7 @@ class InputProcessor:
         cartridge_kv: list["torch.Tensor"] | None = None,
         cartridge_id: str | None = None,
         cartridge_seq_len: int | None = None,
+        cartridge_shm_path: str | None = None,
     ) -> EngineCoreRequest:
         self._validate_lora(lora_request)
         self._validate_params(params)
@@ -606,6 +607,7 @@ class InputProcessor:
             cartridge_kv=cartridge_kv,
             cartridge_id=cartridge_id,
             cartridge_seq_len=cartridge_seq_len,
+            cartridge_shm_path=cartridge_shm_path,
         )
 
     def _validate_model_inputs(

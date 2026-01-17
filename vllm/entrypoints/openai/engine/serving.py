@@ -278,6 +278,7 @@ class OpenAIServing:
         list["torch.Tensor"] | None,
         str | None,
         int | None,
+        str | None,
         LoRARequest | None,
     ]:
         """
@@ -285,7 +286,6 @@ class OpenAIServing:
 
         Args:
             adapters_config: New adapters config with 'prefix' and 'lora' keys
-            cartridges: [DEPRECATED] Old cartridges format for backward compatibility
             prompt_token_ids: Original prompt token IDs
             request_id: Request ID to associate with adapters
 
@@ -294,16 +294,18 @@ class OpenAIServing:
             - Combined token IDs with prefix tokens prepended (for pre-computed),
               or original prompt_token_ids (for learned prefix)
             - Stacked prefix KV tensors [keys, values] for learned prefix,
-              or None if no learned prefix
+              or None if using shm
             - Prefix ID for deduplication, or None if no learned prefix
+            - Prefix sequence length, or None if no learned prefix
+            - Path to prefix KV in shared memory, or None if not saved
             - LoRARequest object if LoRA adapters specified, or None
         """
         if not adapters_config:
-            return prompt_token_ids, None, None, None, None
+            return prompt_token_ids, None, None, None, None, None
 
         # Process prefix adapters (cartridges)
         prefix_specs = adapters_config.get("prefix")
-        prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len = (
+        prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, prefix_shm_path = (
             self._process_cartridges(
                 cartridges=prefix_specs,
                 prompt_token_ids=prompt_token_ids,
@@ -318,19 +320,19 @@ class OpenAIServing:
             request_id=request_id,
         )
 
-        return prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, lora_request
+        return prompt_token_ids, prefix_kv, prefix_id, prefix_seq_len, prefix_shm_path, lora_request
 
     def _process_cartridges(
         self,
         cartridges: list[dict[str, Any]] | None,
         prompt_token_ids: list[int],
         request_id: str | None = None,
-    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, int | None]:
+    ) -> tuple[list[int], list["torch.Tensor"] | None, str | None, int | None, str | None]:
         """
         Load cartridges and process them for the request.
 
         For pre-computed cartridges (with token_ids): prepend token IDs to prompt.
-        For learned cartridges (soft prompts): returns stacked KV tensors for IPC.
+        For learned cartridges (soft prompts): saves KV to shared memory for fast IPC.
 
         Args:
             cartridges: List of cartridge specifications from the request
@@ -342,17 +344,20 @@ class OpenAIServing:
             - Combined token IDs with cartridge tokens prepended (for pre-computed),
               or original prompt_token_ids (for learned cartridges)
             - Stacked cartridge KV tensors [keys, values] for learned cartridges,
-              or None if no learned cartridge
+              or None (use shm_path instead for zero-copy)
             - Cartridge ID for deduplication, or None if no learned cartridge
+            - Cartridge sequence length, or None if no learned cartridge
+            - Path to cartridge KV in shared memory, or None if not saved
         """
         import torch
 
         if not cartridges:
-            return prompt_token_ids, None, None, None
+            return prompt_token_ids, None, None, None, None
 
         from vllm.logger import init_logger
         from vllm.v1.cartridge_loader import (
             load_cartridges_from_request,
+            save_cartridge_to_shm,
         )
 
         logger = init_logger(__name__)
@@ -381,10 +386,11 @@ class OpenAIServing:
                         "and not marked as learned"
                     )
 
-            # Handle learned cartridges - get stacked tensors for IPC (cached)
+            # Handle learned cartridges - save to shm for zero-copy IPC
             stacked_cartridge_kv: list[torch.Tensor] | None = None
             cartridge_id: str | None = None
             cartridge_seq_len: int | None = None
+            cartridge_shm_path: str | None = None
             if learned_cartridges:
                 # Currently only supports one learned cartridge per request
                 if len(learned_cartridges) > 1:
@@ -398,38 +404,44 @@ class OpenAIServing:
                 cartridge_seq_len = cartridge_data.num_tokens
                 assert cartridge_id is not None  # Guaranteed by learned_cartridge_ids
 
-                # Get stacked KV tensors (computed once, then cached).
-                # Only send KV once per cartridge to avoid repeated IPC overhead.
+                # Get stacked KV tensors and save to shm for zero-copy IPC.
+                # Only save once per cartridge to avoid repeated disk writes.
                 if cartridge_id in self._sent_cartridge_ids:
+                    # Already saved to shm, engine core will load from there
                     stacked_cartridge_kv = None
+                    cartridge_shm_path = None
                 else:
                     stacked_cartridge_kv = cartridge_data.get_stacked_kv()
                     if stacked_cartridge_kv is not None:
-                        self._sent_cartridge_ids.add(cartridge_id)
+                        # Validate cartridge is compatible with this model
+                        stacked_keys = stacked_cartridge_kv[0]
+                        _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
+                        expected_kv_heads = self.model_config.get_total_num_kv_heads()
+                        expected_head_size = self.model_config.get_head_size()
+                        if cart_kv_heads != expected_kv_heads:
+                            raise ValueError(
+                                f"Cartridge incompatible with model "
+                                f"{self.model_config.model}: cartridge has "
+                                f"{cart_kv_heads} KV heads but model expects "
+                                f"{expected_kv_heads}. The cartridge may have "
+                                f"been trained on a different model."
+                            )
+                        if cart_head_dim != expected_head_size:
+                            raise ValueError(
+                                f"Cartridge incompatible with model "
+                                f"{self.model_config.model}: cartridge has "
+                                f"head_dim={cart_head_dim} but model expects "
+                                f"{expected_head_size}. The cartridge may have "
+                                f"been trained on a different model."
+                            )
 
-                # Validate cartridge is compatible with this model
-                # (before sending to workers)
-                if stacked_cartridge_kv is not None:
-                    stacked_keys = stacked_cartridge_kv[0]
-                    _, cart_kv_heads, cart_seq_len, cart_head_dim = stacked_keys.shape
-                    expected_kv_heads = self.model_config.get_total_num_kv_heads()
-                    expected_head_size = self.model_config.get_head_size()
-                    if cart_kv_heads != expected_kv_heads:
-                        raise ValueError(
-                            f"Cartridge incompatible with model "
-                            f"{self.model_config.model}: cartridge has "
-                            f"{cart_kv_heads} KV heads but model expects "
-                            f"{expected_kv_heads}. The cartridge may have "
-                            f"been trained on a different model."
+                        # Save to shared memory for zero-copy IPC
+                        cartridge_shm_path = save_cartridge_to_shm(
+                            cartridge_id, stacked_cartridge_kv
                         )
-                    if cart_head_dim != expected_head_size:
-                        raise ValueError(
-                            f"Cartridge incompatible with model "
-                            f"{self.model_config.model}: cartridge has "
-                            f"head_dim={cart_head_dim} but model expects "
-                            f"{expected_head_size}. The cartridge may have "
-                            f"been trained on a different model."
-                        )
+                        # Don't send tensors via IPC, engine core will load from shm
+                        stacked_cartridge_kv = None
+                        self._sent_cartridge_ids.add(cartridge_id)
 
             # Handle pre-computed cartridges (token prepending for prefix caching)
             cartridge_token_ids = []
@@ -447,6 +459,7 @@ class OpenAIServing:
                     stacked_cartridge_kv,
                     cartridge_id,
                     cartridge_seq_len,
+                    cartridge_shm_path,
                 )
             else:
                 return (
@@ -454,6 +467,7 @@ class OpenAIServing:
                     stacked_cartridge_kv,
                     cartridge_id,
                     cartridge_seq_len,
+                    cartridge_shm_path,
                 )
 
         except Exception as e:
@@ -1631,6 +1645,7 @@ class OpenAIServing:
         cartridge_kv: list[torch.Tensor] | None = None,
         cartridge_id: str | None = None,
         cartridge_seq_len: int | None = None,
+        cartridge_shm_path: str | None = None,
         data_parallel_rank: int | None = None,
     ) -> tuple[EngineCoreRequest, dict[str, Any]]:
         """Use the Processor to process inputs for AsyncLLM."""
@@ -1650,6 +1665,7 @@ class OpenAIServing:
             cartridge_kv=cartridge_kv,
             cartridge_id=cartridge_id,
             cartridge_seq_len=cartridge_seq_len,
+            cartridge_shm_path=cartridge_shm_path,
             data_parallel_rank=data_parallel_rank,
         )
         return engine_request, tokenization_kwargs

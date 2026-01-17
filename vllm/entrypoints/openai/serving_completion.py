@@ -240,6 +240,7 @@ class OpenAIServingCompletion(OpenAIServing):
                             cartridge_kv,
                             cartridge_id,
                             cartridge_seq_len,
+                            cartridge_shm_path,
                             dynamic_lora_request,
                         ) = self._process_adapters(
                             adapters_config=adapters_dict,
@@ -270,6 +271,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         cartridge_kv=cartridge_kv,
                         cartridge_id=cartridge_id,
                         cartridge_seq_len=cartridge_seq_len,
+                        cartridge_shm_path=cartridge_shm_path,
                         data_parallel_rank=data_parallel_rank,
                     )
 

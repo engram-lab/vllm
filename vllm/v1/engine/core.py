@@ -104,6 +104,8 @@ class EngineCore:
         self.log_stats = log_stats
         # Cache learned cartridge KV on the engine core to avoid repeated IPC.
         self._cartridge_kv_cache: dict[str, list[torch.Tensor]] = {}
+        # Track cartridge IDs loaded from shm for cleanup
+        self._cartridge_shm_ids: set[str] = set()
 
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
@@ -543,6 +545,18 @@ class EngineCore:
             self.model_executor.shutdown()
         if self.scheduler:
             self.scheduler.shutdown()
+        # Clean up cartridge shm files
+        self._cleanup_cartridge_shm()
+
+    def _cleanup_cartridge_shm(self):
+        """Clean up shared memory files for cartridges loaded from shm."""
+        if not self._cartridge_shm_ids:
+            return
+        from vllm.v1.cartridge_loader import cleanup_cartridge_shm
+        for cartridge_id in list(self._cartridge_shm_ids):
+            cleanup_cartridge_shm(cartridge_id)
+        self._cartridge_shm_ids.clear()
+        self._cartridge_kv_cache.clear()
 
     def profile(self, is_start: bool = True):
         self.model_executor.profile(is_start)
@@ -626,8 +640,21 @@ class EngineCore:
                 request.mm_features
             )
 
-        if request.cartridge_id and request.cartridge_kv is not None:
-            self._cartridge_kv_cache[request.cartridge_id] = request.cartridge_kv
+        # Handle cartridge KV: load from shm if path provided, otherwise use IPC tensor
+        if request.cartridge_id:
+            if request.cartridge_id not in self._cartridge_kv_cache:
+                # First time seeing this cartridge - load from shm or use IPC tensor
+                if request.cartridge_shm_path:
+                    # Load from shared memory (fast, zero-copy from RAM)
+                    from vllm.v1.cartridge_loader import load_cartridge_from_shm
+                    stacked_kv = load_cartridge_from_shm(request.cartridge_shm_path)
+                    if stacked_kv is not None:
+                        self._cartridge_kv_cache[request.cartridge_id] = stacked_kv
+                        self._cartridge_shm_ids.add(request.cartridge_id)
+                        request.cartridge_kv = stacked_kv
+                elif request.cartridge_kv is not None:
+                    # Fallback: use IPC tensor (legacy path)
+                    self._cartridge_kv_cache[request.cartridge_id] = request.cartridge_kv
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
         if req.cartridge_kv is None and req.cartridge_id in self._cartridge_kv_cache:

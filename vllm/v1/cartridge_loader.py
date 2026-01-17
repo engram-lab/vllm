@@ -15,6 +15,8 @@ Cartridges support two use cases:
    - Requires direct KV injection into attention (not token prepending)
 """
 
+import hashlib
+import os
 import re
 from typing import Any
 
@@ -24,6 +26,102 @@ from vllm.logger import init_logger
 from vllm.utils.adapter_manager import get_adapter_manager
 
 logger = init_logger(__name__)
+
+# Directory for shared memory cartridge files (RAM-backed for fast IPC)
+SHM_CARTRIDGE_DIR = "/dev/shm/vllm_cartridges"
+
+# Track active shm paths for cleanup
+_active_shm_paths: dict[str, str] = {}  # cartridge_id -> shm_path
+
+
+def _get_shm_path(cartridge_id: str) -> str:
+    """Get the shared memory path for a cartridge ID."""
+    # Use SHA256 hash to avoid path issues with special characters
+    id_hash = hashlib.sha256(cartridge_id.encode()).hexdigest()[:16]
+    return os.path.join(SHM_CARTRIDGE_DIR, f"cart_{id_hash}.pt")
+
+
+def save_cartridge_to_shm(
+    cartridge_id: str,
+    stacked_kv: list[torch.Tensor],
+) -> str:
+    """Save cartridge KV tensors to shared memory for zero-copy IPC.
+
+    Args:
+        cartridge_id: Unique identifier for the cartridge
+        stacked_kv: List of [stacked_keys, stacked_values] tensors
+
+    Returns:
+        Path to the shared memory file
+    """
+    os.makedirs(SHM_CARTRIDGE_DIR, exist_ok=True)
+    shm_path = _get_shm_path(cartridge_id)
+
+    # Skip if already saved (another request may have saved it)
+    if os.path.exists(shm_path):
+        logger.debug("Cartridge already in shm: %s", shm_path)
+        _active_shm_paths[cartridge_id] = shm_path
+        return shm_path
+
+    # Save tensors to shm
+    torch.save(stacked_kv, shm_path)
+    _active_shm_paths[cartridge_id] = shm_path
+    logger.info(
+        "Saved cartridge to shm: %s (%.2f MB)",
+        shm_path,
+        os.path.getsize(shm_path) / (1024 * 1024),
+    )
+    return shm_path
+
+
+def load_cartridge_from_shm(shm_path: str) -> list[torch.Tensor] | None:
+    """Load cartridge KV tensors from shared memory.
+
+    Args:
+        shm_path: Path to the shared memory file
+
+    Returns:
+        List of [stacked_keys, stacked_values] tensors, or None if not found
+    """
+    if not os.path.exists(shm_path):
+        logger.warning("Cartridge shm file not found: %s", shm_path)
+        return None
+
+    stacked_kv = torch.load(shm_path, map_location="cpu", weights_only=True)
+    logger.info("Loaded cartridge from shm: %s", shm_path)
+    return stacked_kv
+
+
+def cleanup_cartridge_shm(cartridge_id: str) -> None:
+    """Clean up shared memory file for a cartridge.
+
+    Args:
+        cartridge_id: Unique identifier for the cartridge
+    """
+    shm_path = _active_shm_paths.pop(cartridge_id, None)
+    if shm_path is None:
+        shm_path = _get_shm_path(cartridge_id)
+
+    if os.path.exists(shm_path):
+        try:
+            os.unlink(shm_path)
+            logger.info("Cleaned up cartridge shm: %s", shm_path)
+        except OSError as e:
+            logger.warning("Failed to cleanup cartridge shm %s: %s", shm_path, e)
+
+
+def cleanup_all_cartridge_shm() -> None:
+    """Clean up all shared memory cartridge files."""
+    if os.path.exists(SHM_CARTRIDGE_DIR):
+        for filename in os.listdir(SHM_CARTRIDGE_DIR):
+            if filename.startswith("cart_") and filename.endswith(".pt"):
+                filepath = os.path.join(SHM_CARTRIDGE_DIR, filename)
+                try:
+                    os.unlink(filepath)
+                except OSError:
+                    pass
+        logger.info("Cleaned up all cartridge shm files")
+    _active_shm_paths.clear()
 
 # Compiled pattern for matching KV cache layer keys
 _KV_LAYER_PATTERN = re.compile(r"layers\.(\d+)\.attention\.prefix\.(keys|values)")
