@@ -102,7 +102,12 @@ app = modal.App("vllm-ci-benchmark")
     },
     enable_memory_snapshot=False,
 )
-def run_benchmarks_with_server(model: str, tensor_parallel_size: int, config_jsons: list[str]):
+def run_benchmarks_with_server(
+    model: str,
+    tensor_parallel_size: int,
+    config_jsons: list[str],
+    enforce_eager: bool,
+):
     """
     Start vLLM server, run all benchmarks, then stop server.
 
@@ -122,6 +127,7 @@ def run_benchmarks_with_server(model: str, tensor_parallel_size: int, config_jso
     print(f"Model: {model}")
     print(f"GPU allocation: {GPU_COUNT}x {GPU_TYPE}")
     print(f"Tensor Parallel Size: {tensor_parallel_size}")
+    print(f"Enforce eager: {enforce_eager}")
     print("=" * 80)
     print()
 
@@ -152,6 +158,8 @@ def run_benchmarks_with_server(model: str, tensor_parallel_size: int, config_jso
         "--enable-prefix-caching",
         "--enable-chunked-prefill",
     ]
+    if enforce_eager:
+        cmd.append("--enforce-eager")
 
     print(f"Server command: {' '.join(cmd)}")
     print()
@@ -429,7 +437,8 @@ def main(*args):
             --config-paths .github/benchmark_configs/base_latency.json \\
             --config-paths .github/benchmark_configs/base_throughput.json
 
-    Note: All configs must use the same model and tensor_parallel_size to share a server.
+    Note: All configs must use the same model, tensor_parallel_size, and enforce_eager
+    to share a server.
     """
     import argparse
 
@@ -457,6 +466,7 @@ def main(*args):
     if len(configs) > 1:
         first_model = configs[0]["model_name"]
         first_tp_size = configs[0].get("tensor_parallel_size", GPU_COUNT)
+        first_enforce_eager = configs[0].get("enforce_eager", False)
 
         for i, config in enumerate(configs[1:], 2):
             model = config["model_name"]
@@ -471,10 +481,19 @@ def main(*args):
                 print(f"ERROR: Config {i} uses different tensor_parallel_size ({tp_size}) than config 1 ({first_tp_size})")
                 print("All configs must use the same tensor_parallel_size to share a server.")
                 sys.exit(1)
+            enforce_eager = config.get("enforce_eager", False)
+            if enforce_eager != first_enforce_eager:
+                print(
+                    f"ERROR: Config {i} uses different enforce_eager ({enforce_eager}) "
+                    f"than config 1 ({first_enforce_eager})"
+                )
+                print("All configs must use the same enforce_eager to share a server.")
+                sys.exit(1)
 
     # Get model and tensor_parallel_size from first config
     model = configs[0]["model_name"]
     tensor_parallel_size = configs[0].get("tensor_parallel_size", GPU_COUNT)
+    enforce_eager = configs[0].get("enforce_eager", False)
 
     print("\n" + "=" * 80)
     print(f"STARTING SHARED vLLM SERVER FOR {len(configs)} BENCHMARK(S)")
@@ -482,11 +501,17 @@ def main(*args):
     print(f"Model: {model}")
     print(f"Tensor Parallel Size: {tensor_parallel_size}")
     print(f"GPU allocation: {GPU_COUNT}x {GPU_TYPE}")
+    print(f"Enforce eager: {enforce_eager}")
     print("=" * 80)
     print()
 
     # Run all benchmarks with a single server
-    all_results = run_benchmarks_with_server.remote(model, tensor_parallel_size, config_jsons)
+    all_results = run_benchmarks_with_server.remote(
+        model,
+        tensor_parallel_size,
+        config_jsons,
+        enforce_eager,
+    )
 
     # Print results for each config
     for i, (config_path, result) in enumerate(zip(config_paths, all_results), 1):

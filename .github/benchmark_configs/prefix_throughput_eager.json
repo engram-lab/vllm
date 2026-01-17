@@ -1,0 +1,29 @@
+{
+  "name": "prefix_throughput_eager",
+  "description": "CI benchmark for eager throughput with cartridge prefix - asserts output throughput > 100 tok/s",
+  "model_name": "Qwen/Qwen3-8B",
+  "dataset_name": "random",
+  "extra_body": {
+    "adapters": {
+      "prefix": [
+        {
+          "id": "s3://engram-cartridges/weights/torchtitan/2026-01-14/07-17-01-qwen3-8b-workspace-sabri-2026-01-14_07-16-56-d20c80e2/step-4800/model.pt",
+          "source": "s3",
+          "force_redownload": false
+        }
+      ]
+    }
+  },
+  "num_prompts": 250,
+  "prompt_len": 1,
+  "output_len": 128,
+  "max_concurrency": 50,
+  "request_rate": "inf",
+  "stream": false,
+  "num_warmups": 10,
+  "seed": 42,
+  "tensor_parallel_size": 1,
+  "assert_type": "throughput",
+  "throughput_threshold_tok_s": 100.0,
+  "enforce_eager": true
+}
