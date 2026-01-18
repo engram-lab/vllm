@@ -404,11 +404,10 @@ class OpenAIServing:
                 cartridge_seq_len = cartridge_data.num_tokens
                 assert cartridge_id is not None  # Guaranteed by learned_cartridge_ids
 
-                # Get stacked KV tensors and save to shared storage for zero-copy IPC.
-                # Use volume-backed storage instead of /dev/shm for Modal compatibility.
-                # Only save once per cartridge to avoid repeated disk writes.
+                # Get stacked KV tensors and save to /dev/shm for zero-copy IPC.
+                # Only save once per cartridge to avoid repeated writes.
                 if cartridge_id in self._sent_cartridge_ids:
-                    # Already saved to shared storage, engine core will load from there
+                    # Already saved to /dev/shm, engine core will load from there
                     stacked_cartridge_kv = None
                     cartridge_shm_path = None
                 else:
@@ -436,11 +435,11 @@ class OpenAIServing:
                                 f"been trained on a different model."
                             )
 
-                        # Save to shared storage (Modal volume) for zero-copy IPC
+                        # Save to /dev/shm for zero-copy IPC
                         cartridge_shm_path = save_cartridge_to_shm(
                             cartridge_id, stacked_cartridge_kv
                         )
-                        # Don't send tensors via IPC, engine core will load from shared storage
+                        # Don't send tensors via IPC, engine core will load from /dev/shm
                         stacked_cartridge_kv = None
                         self._sent_cartridge_ids.add(cartridge_id)
                     else:

@@ -28,9 +28,8 @@ from vllm.utils.adapter_manager import get_adapter_manager
 logger = init_logger(__name__)
 
 # Directory for cartridge IPC files
-# Use /root/.cache/vllm/cartridges instead of /dev/shm for Modal compatibility
-# Modal volumes are shared across processes, /dev/shm is not
-SHM_CARTRIDGE_DIR = "/root/.cache/vllm/cartridges"
+# Using /dev/shm for fast RAM-backed IPC (testing if Modal shares /dev/shm between processes)
+SHM_CARTRIDGE_DIR = "/dev/shm/vllm_cartridges"
 
 # Track active shm paths for cleanup
 _active_shm_paths: dict[str, str] = {}  # cartridge_id -> shm_path
