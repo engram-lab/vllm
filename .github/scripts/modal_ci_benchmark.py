@@ -69,7 +69,7 @@ image = (
     .env(
         {
             "HF_XET_HIGH_PERFORMANCE": "1",
-            "HF_HUB_ENABLE_HF_TRANSFER": "1",
+            "HF_HUB_ENABLE_HF_TRANSFER": "0",
             "XFORMERS_ENABLE_TRITON": "1",
             "VLLM_SERVER_DEV_MODE": "1",
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
