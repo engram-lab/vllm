@@ -401,8 +401,10 @@ class OpenAIServingChat(OpenAIServing):
                 # Process adapters (prefix/lora) if present
                 cartridge_kv = None
                 cartridge_id = None
+                cartridge_seq_len = None
+                cartridge_shm_path = None
                 dynamic_lora_request = None
-                
+
                 # Convert adapters config to dict if present
                 adapters_dict = None
                 if request.adapters:
@@ -414,7 +416,14 @@ class OpenAIServingChat(OpenAIServing):
                 
                 # Process all adapters (prefix + lora)
                 if adapters_dict:
-                    engine_prompt["prompt_token_ids"], cartridge_kv, cartridge_id, dynamic_lora_request = self._process_adapters(
+                    (
+                        engine_prompt["prompt_token_ids"],
+                        cartridge_kv,
+                        cartridge_id,
+                        cartridge_seq_len,
+                        cartridge_shm_path,
+                        dynamic_lora_request,
+                    ) = self._process_adapters(
                         adapters_config=adapters_dict,
                         prompt_token_ids=engine_prompt["prompt_token_ids"],
                         request_id=sub_request_id,
@@ -440,6 +449,10 @@ class OpenAIServingChat(OpenAIServing):
                         lora_request=lora_request,
                         trace_headers=trace_headers,
                         priority=request.priority,
+                        cartridge_kv=cartridge_kv,
+                        cartridge_id=cartridge_id,
+                        cartridge_seq_len=cartridge_seq_len,
+                        cartridge_shm_path=cartridge_shm_path,
                         data_parallel_rank=data_parallel_rank,
                     )
 

@@ -16,7 +16,6 @@ permissions:
 
 jobs:
   throughput-benchmark:
-    if: false  # Temporarily skipped; use eager workflow instead.
     runs-on: ubuntu-latest
     timeout-minutes: 45
 

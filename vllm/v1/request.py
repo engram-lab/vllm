@@ -44,6 +44,9 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        cartridge_kv: list[torch.Tensor] | None = None,
+        cartridge_id: str | None = None,
+        cartridge_seq_len: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -108,6 +111,21 @@ class Request:
         self.num_encoder_inputs = len(self.mm_features)
         self.has_encoder_inputs = self.num_encoder_inputs > 0
 
+        # Cartridge KV for learned cartridge injection.
+        # Format: [stacked_keys, stacked_values] where each is
+        # (num_layers, num_heads, seq_len, head_dim)
+        self.cartridge_kv = cartridge_kv
+        # Cartridge identifier for deduplication across IPC
+        self.cartridge_id = cartridge_id
+
+        # Track cartridge sequence length (occupies cache positions 0 to cart_seq_len-1)
+        if cartridge_kv is not None:
+            # cartridge_kv is [keys, values] where keys.shape =
+            # (num_layers, num_heads, seq_len, head_dim)
+            self.cartridge_seq_len = cartridge_kv[0].shape[2]
+        else:
+            self.cartridge_seq_len = cartridge_seq_len or 0
+
         # Read-only views
         # Prevent directly appending to these lists since
         # they should also be updated simultaneously.
@@ -158,6 +176,9 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            cartridge_kv=request.cartridge_kv,
+            cartridge_id=request.cartridge_id,
+            cartridge_seq_len=request.cartridge_seq_len,
         )
 
     def append_output_token_ids(
@@ -191,6 +212,10 @@ class Request:
         return len(self._output_token_ids)
 
     def get_skip_reading_prefix_cache(self) -> bool:
+        # NOTE: Cartridge requests CAN use prefix cache now. The cartridge_id
+        # is included in block hashes (see kv_cache_utils.py), so requests with
+        # the same cartridge share cache while different cartridges don't collide.
+        # This ensures RoPE positions are consistent (same cartridge = same offset).
         if (
             self.sampling_params is not None
             and self.sampling_params.skip_reading_prefix_cache is not None

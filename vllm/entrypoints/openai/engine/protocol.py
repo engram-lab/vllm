@@ -623,6 +623,13 @@ class CompletionRequest(OpenAIBaseModel):
             "through out the inference process and return in response."
         ),
     )
+    adapters: AdaptersConfig | None = Field(
+        default=None,
+        description=(
+            "Adapters configuration for this request. Supports prefix (KV cache) "
+            "and LoRA adapters that can be loaded from S3, local storage, etc."
+        ),
+    )
     logits_processors: LogitsProcessors | None = Field(
         default=None,
         description=(

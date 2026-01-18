@@ -64,6 +64,18 @@ class EngineCoreRequest(
     data_parallel_rank: int | None
     prompt_embeds: torch.Tensor | None = None
 
+    # Learned cartridge KV cache for injection into attention.
+    # Shape: (num_layers, num_kv_heads, seq_len, head_dim) for each tensor.
+    # This is a list [keys_stacked, values_stacked] where each is a stacked tensor.
+    cartridge_kv: list[torch.Tensor] | None = None
+    # Cartridge identifier for deduplication across IPC
+    cartridge_id: str | None = None
+    # Cartridge sequence length for prefix hashing when KV is omitted.
+    cartridge_seq_len: int | None = None
+    # Path to cartridge KV in shared memory (/dev/shm) for zero-copy IPC.
+    # When set, engine core loads from this path instead of receiving via IPC.
+    cartridge_shm_path: str | None = None
+
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.
     client_index: int = 0

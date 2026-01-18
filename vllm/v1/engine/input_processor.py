@@ -454,6 +454,10 @@ class InputProcessor:
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        cartridge_kv: list["torch.Tensor"] | None = None,
+        cartridge_id: str | None = None,
+        cartridge_seq_len: int | None = None,
+        cartridge_shm_path: str | None = None,
     ) -> EngineCoreRequest:
         self._validate_lora(lora_request)
         self._validate_params(params)
@@ -597,6 +601,10 @@ class InputProcessor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            cartridge_kv=cartridge_kv,
+            cartridge_id=cartridge_id,
+            cartridge_seq_len=cartridge_seq_len,
+            cartridge_shm_path=cartridge_shm_path,
         )
 
     def _validate_model_inputs(
