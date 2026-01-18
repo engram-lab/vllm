@@ -404,18 +404,15 @@ class OpenAIServing:
                 cartridge_seq_len = cartridge_data.num_tokens
                 assert cartridge_id is not None  # Guaranteed by learned_cartridge_ids
 
-                # Get stacked KV tensors - always send via IPC on first use.
-                # /dev/shm doesn't work across Modal processes, so we skip shm optimization.
-                # Cache the cartridge_kv after first send to avoid reloading from disk.
+                # Get stacked KV tensors and save to shared storage for zero-copy IPC.
+                # Use volume-backed storage instead of /dev/shm for Modal compatibility.
+                # Only save once per cartridge to avoid repeated disk writes.
                 if cartridge_id in self._sent_cartridge_ids:
-                    # Engine core already has this cached, send None
+                    # Already saved to shared storage, engine core will load from there
                     stacked_cartridge_kv = None
                     cartridge_shm_path = None
                 else:
                     stacked_cartridge_kv = cartridge_data.get_stacked_kv()
-                    # Always set shm_path (even if kv is None) to avoid UnboundLocalError
-                    cartridge_shm_path = None
-
                     if stacked_cartridge_kv is not None:
                         # Validate cartridge is compatible with this model
                         stacked_keys = stacked_cartridge_kv[0]
@@ -439,9 +436,16 @@ class OpenAIServing:
                                 f"been trained on a different model."
                             )
 
-                        # Send KV directly via IPC (shm doesn't work across Modal processes)
-                        # Engine core will cache it for future requests
+                        # Save to shared storage (Modal volume) for zero-copy IPC
+                        cartridge_shm_path = save_cartridge_to_shm(
+                            cartridge_id, stacked_cartridge_kv
+                        )
+                        # Don't send tensors via IPC, engine core will load from shared storage
+                        stacked_cartridge_kv = None
                         self._sent_cartridge_ids.add(cartridge_id)
+                    else:
+                        # No KV data available
+                        cartridge_shm_path = None
 
             # Handle pre-computed cartridges (token prepending for prefix caching)
             cartridge_token_ids = []
