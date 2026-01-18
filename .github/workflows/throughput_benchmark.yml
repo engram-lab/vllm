@@ -25,6 +25,7 @@ jobs:
       GPU_TYPE: "H200"
       GPU_COUNT: "1"
       THROUGHPUT_THRESHOLD_TOK_S: "2500.0"
+      BRANCH: ${{ github.head_ref || github.ref_name }}
 
     steps:
       - name: Checkout code
