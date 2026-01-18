@@ -9,11 +9,6 @@ Runs benchmarks and asserts thresholds based on config:
 Exits with status code 0 if all passed, 1 if any failed.
 
 Usage:
-    # Single config
-    modal run .github/scripts/modal_ci_benchmark.py \
-        --config-paths .github/benchmark_configs/base_latency.json
-
-    # Multiple configs
     modal run .github/scripts/modal_ci_benchmark.py \
         --config-paths .github/benchmark_configs/base_latency.json \
         --config-paths .github/benchmark_configs/base_throughput.json
@@ -157,6 +152,7 @@ def run_benchmarks_with_server(
         "--disable-log-requests",
         "--enable-prefix-caching",
         "--enable-chunked-prefill",
+        "--disable-cascade-attn",
     ]
     if enforce_eager:
         cmd.append("--enforce-eager")
